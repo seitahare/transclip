@@ -1,0 +1,2 @@
+av==18.1.0
+faster-whisper==1.2.1
