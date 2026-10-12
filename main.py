@@ -7,6 +7,7 @@ from pathlib import Path
 from selector import select_clip
 
 from subtitles import ensure_transcript
+from clipper import create_clip
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -126,7 +127,16 @@ def fetch(url):
     print(f"Video: {video_dir}")
     print(f"Transcript: {transcript_path}")
 
-    return select_clip(video_id)
+    try:
+        selection_path = select_clip(video_id)
+    except (OSError, ValueError) as error:
+        print(f"Error: Clip selection failed: {error}")
+        return 1
+
+    if selection_path is None:
+        return 0
+
+    return create_clip(video_id)
 
 
 def main():
