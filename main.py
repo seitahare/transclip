@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from selector import select_clip
 
 from subtitles import ensure_transcript
 
@@ -125,7 +126,7 @@ def fetch(url):
     print(f"Video: {video_dir}")
     print(f"Transcript: {transcript_path}")
 
-    return 0
+    return select_clip(video_id)
 
 
 def main():
