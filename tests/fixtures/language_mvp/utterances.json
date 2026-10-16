@@ -1,0 +1,118 @@
+{
+  "video_id": "fixture",
+  "format_version": 3,
+  "clip": {
+    "start": 100.0,
+    "end": 145.0
+  },
+  "utterances": [
+    {
+      "id": 1,
+      "speaker": "A",
+      "start": 100.0,
+      "end": 102.0,
+      "relative_start": 0.0,
+      "relative_end": 2.0,
+      "text_en": "As Dario said,",
+      "review_required": false,
+      "review_reasons": [],
+      "words": [],
+      "end_reason": "speaker_change"
+    },
+    {
+      "id": 2,
+      "speaker": "A",
+      "start": 102.1,
+      "end": 105.0,
+      "relative_start": 2.1,
+      "relative_end": 5.0,
+      "text_en": "AI might not replace 75% of jobs.",
+      "review_required": false,
+      "review_reasons": [],
+      "words": [],
+      "end_reason": "sentence_end"
+    },
+    {
+      "id": 3,
+      "speaker": "B",
+      "start": 103.0,
+      "end": 104.0,
+      "relative_start": 3.0,
+      "relative_end": 4.0,
+      "text_en": "Yes.",
+      "review_required": false,
+      "review_reasons": [],
+      "words": [],
+      "end_reason": "sentence_end"
+    },
+    {
+      "id": 4,
+      "speaker": null,
+      "start": 105.1,
+      "end": 105.5,
+      "relative_start": 5.1,
+      "relative_end": 5.5,
+      "text_en": "perhaps,",
+      "review_required": true,
+      "review_reasons": [
+        "unknown_speaker"
+      ],
+      "words": [],
+      "end_reason": "speaker_change"
+    },
+    {
+      "id": 5,
+      "speaker": null,
+      "start": 105.6,
+      "end": 106.0,
+      "relative_start": 5.6,
+      "relative_end": 6.0,
+      "text_en": "well,",
+      "review_required": true,
+      "review_reasons": [
+        "unknown_speaker"
+      ],
+      "words": [],
+      "end_reason": "speaker_change"
+    },
+    {
+      "id": 6,
+      "speaker": "A",
+      "start": 107.0,
+      "end": 109.0,
+      "relative_start": 7.0,
+      "relative_end": 9.0,
+      "text_en": "I think it works.",
+      "review_required": false,
+      "review_reasons": [],
+      "words": [],
+      "end_reason": "sentence_end"
+    },
+    {
+      "id": 7,
+      "speaker": "A",
+      "start": 128.0,
+      "end": 132.0,
+      "relative_start": 28.0,
+      "relative_end": 32.0,
+      "text_en": "This crosses the preview boundary.",
+      "review_required": false,
+      "review_reasons": [],
+      "words": [],
+      "end_reason": "sentence_end"
+    },
+    {
+      "id": 8,
+      "speaker": "B",
+      "start": 133.0,
+      "end": 135.0,
+      "relative_start": 33.0,
+      "relative_end": 35.0,
+      "text_en": "Later.",
+      "review_required": false,
+      "review_reasons": [],
+      "words": [],
+      "end_reason": "sentence_end"
+    }
+  ]
+}

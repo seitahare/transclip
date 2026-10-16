@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "revision": "2026-10-mvp-1",
+  "instructions": [
+    "原文の意味・否定・数字・割合・固有名詞・推測と不確実性を維持する。",
+    "不要な繰り返しと不自然な主語の反復を整理し、文脈に応じて語順を変えてよい。",
+    "内容の捏造や意味の省略を禁止する。英文の分割位置に機械的に従わない。",
+    "文脈の別話者の内容を翻訳対象に混ぜない。UNKNOWNを推定で確定しない。",
+    "時間内に収まらなくても内容を削らず、review_requiredを付ける。"
+  ],
+  "checks": ["numbers", "names", "negation", "uncertainty"],
+  "name_aliases": {
+    "AI": ["AI", "人工知能", "エーアイ"],
+    "Dario": ["Dario", "ダリオ"],
+    "Americans": ["アメリカ人", "米国人"],
+    "America": ["アメリカ", "米国"]
+  },
+  "pronunciations": {"AI": "エーアイ", "Dario": "ダリオ", "ダリオ": "ダリオ"},
+  "japanese_negation_pattern": "ない|なかった|なく|ません|ずに|ぬ|不可能|否定|違う|ゼロ|禁止|無い",
+  "japanese_uncertainty_pattern": "思|考え|かもしれ|だろう|でしょう|おそらく|多分|たぶん|らしい|ようだ|ようです|可能性|推測",
+  "local_rewrites": [
+    {"id": "concise_thought", "from": "というふうに思います", "to": "と思います"},
+    {"id": "concise_hedge", "from": "のではないかと思います", "to": "かもしれないと思います"}
+  ]
+}

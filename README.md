@@ -149,12 +149,25 @@ transclip/
 python -m unittest discover -s tests -v
 ```
 
-GitHub上で確認できた既存テストは `test_subtitles.py` と `test_clipper.py` の計4件です。ローカル追加モジュールのテストや統合テストは継続整備中です。テスト成功と音声・字幕の品質保証は別物です。
+既存の字幕・切り抜き4テストに加え、言語エンジンと台本生成のテストを追加しています。解析器を使うテストは `requirements-language.txt` の環境で実行してください。依存未導入なら該当テストは明示的にスキップされます。テスト成功と音声・字幕の品質保証は別物です。
+
+## 日英言語エンジン・台本最適化MVP
+
+`dubbing_script.py` を追加しました。既存の発話・翻訳JSONを読み、同一話者のグルーピング、spaCy / SudachiPy解析、読み・モーラによる時間推定、翻訳ルールの検査、比較表を出力します。UNKNOWNと同時発話を保持し、長すぎる音声は切断せずレビューに残します。
+
+新依存は独立した `.venv-language` と `requirements-language.txt` で扱います。通常環境やQwen環境の変更は不要です。セットアップ、30秒MVP、フィクスチャ、ローカル候補入力、実測との区別は [docs/LANGUAGE_ENGINE.md](docs/LANGUAGE_ENGINE.md) を参照してください。
+
+```bash
+.venv-language/bin/python dubbing_script.py VIDEO_ID --seconds 30
+.venv-language/bin/python -m unittest discover -s tests -v
+```
+
+既定処理はAPIを呼ばず、限定的なローカル短縮規則を適用します。自由な言い換えは別途候補入力で比較します。候補の意味と実音声の長さはレビューが必要です。異なる既存出力は上書きしません。
 
 ## 次の開発課題
 
-- `language/` に英語・日本語の言語解析、読み・モーラ、発話時間推定とバージョン付きルールを実装する。
-- `dubbing_script.py` で細切れの発話を統合し、元の意味を保った自然な短い日本語を作る。
+- 言語エンジンの数詞・助数詞・意味保持検査を拡充する。
+- 台本候補の生成プロバイダを接続し、短縮案の聴取・意味確認を進める。
 - Qwen3-TTSのWAV実測長を利用し、発話時間を反復的に改善する。
 - `UNKNOWN`・同時発話を確認し、正しい話者へ割り当てるためのレビュー手段を作る。
 - 適切な権利・許可がある場合に限り、参照音声による声質再現を検証する。

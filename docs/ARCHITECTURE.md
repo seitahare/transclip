@@ -51,9 +51,10 @@ clipper.py ──► output/<video_id>/clip_<start>_<end>.mp4
              └─ tts_generator.py ───► output/<video_id>/tts/*.wav
                                          tts/manifest.json
 
-[計画中]
+[実装済みMVP: 詳細は LANGUAGE_ENGINE.md]
   language/* + dubbing_script.py
        └─► dubbing_script.json + timing diagnostics
+[計画中]
   approved_voice_profile/* ──────► speaker-aware TTS (権利確認後)
   audio_mixer.py ────────────────► dubbed_<range>.mp4
 ```
@@ -135,7 +136,7 @@ JSON同士を統合するときは `clip.start` と `clip.end` を照合し、30
 7. **費用をコントロール**: モデル/API呼び出しには明確な入口を設け、`--dry-run` / 30秒 / 少件数の試験を優先する。
 8. **承諾のある音声のみ声質再現**: 声質のクロスリンガル再現は検討対象だが、実在人物の無断複製や権利不明の公開を前提としない。
 
-## 5. 新しく作る `language/` の責務（計画）
+## 5. `language/` の責務（MVP実装済み）
 
 ```text
 language/
@@ -154,9 +155,9 @@ dubbing_script.py   # 会話文脈・話者・時間に応じた台本作成
 - モーラ数や文字数は**時間推定の特徴量**であり真の所要時間ではない。TTSで生成したWAVの実測長、ポーズ、話速、話者／モデル別差異を反映する。
 - 構文解析器は説明可能な補助情報を提供するもので、英日で単語・文法を一対一対応させる必要はない。
 
-## 6. 新規台本データの提案（未実装）
+## 6. 台本データの設計とMVP
 
-中間データと混同しないよう、別の `dubbing_script.json` を設計します。以下は**提案スキーマ**で、現在のコードが書き出している形式ではありません。
+中間データと混同しないよう、別の `dubbing_script.json` を設計します。以下は当初の最小設計例です。実装済みのv1は出典・比較用旧訳・解析結果・タイムライン等を追加しています。現行の契約と制約は [LANGUAGE_ENGINE.md](LANGUAGE_ENGINE.md) を参照してください。
 
 ```json
 {
@@ -181,7 +182,7 @@ dubbing_script.py   # 会話文脈・話者・時間に応じた台本作成
 }
 ```
 
-この例の文章や時間はスキーマ説明用です。推定長とWAV実測長を分け、`review_required` と原文の出典を保持することが重要です。実装前に既存の話者・翻訳・TTS側コードを再確認し、実際の連携に合う最小の契約を確定すること。
+この例の文章や時間はスキーマ説明用です。推定長とWAV実測長を分け、`review_required` と原文の出典を保持することが重要です。既存の話者・翻訳JSONとの照合を実装済みです。TTSとの自動連携は今後の課題です。
 
 ## 7. 処理と環境の境界
 
