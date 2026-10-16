@@ -57,7 +57,7 @@ def select_clip(video_id):
     chapters = metadata.get("chapters") or []
 
     if duration is None:
-        raise valueError("video duration is unknown.")
+        raise ValueError("video duration is unknown.")
 
     while True:
 
