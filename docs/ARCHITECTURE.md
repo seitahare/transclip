@@ -54,6 +54,8 @@ clipper.py ──► output/<video_id>/clip_<start>_<end>.mp4
 [実装済みMVP: 詳細は LANGUAGE_ENGINE.md]
   language/* + dubbing_script.py
        └─► dubbing_script.json + timing diagnostics
+                  └─► tts_generator.py --script / tts_feedback.py
+                         └─► 話者別WAV / feedback.json / 校正用標本
 [計画中]
   approved_voice_profile/* ──────► speaker-aware TTS (権利確認後)
   audio_mixer.py ────────────────► dubbed_<range>.mp4
@@ -233,3 +235,7 @@ python -m unittest discover -s tests -v
 6. 変更ファイル、検証結果、残る未確定点、必要な移行手順を日本語で報告する。
 
 **作らないもの（今回のMVP）**: トークナイザのフルスクラッチ実装、元動画の大規模一括再ダウンロード、全尺の自動吹き替え、無承諾での声質複製、既存のデータスキーマの破壊的な書き換え。
+
+## 10. Phase 2: TTS Feedback Engine（実装済み）
+
+`tts_generator.py --script` を独立したQwen環境で実行し、`tts_feedback.py` が入力検証・WAV/receiptキャッシュ・再開・実測比較・衝突・校正を管理します。元の台本、旧manifest、旧WAVを保持した別出力です。UNKNOWNは生成せず記録し、別話者の重なりを直列化しません。校正は話者・モデル・音声設定ごとに分離し、自動適用しません。詳細は [TTS_FEEDBACK.md](TTS_FEEDBACK.md) を参照してください。

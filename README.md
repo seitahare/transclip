@@ -164,11 +164,22 @@ python -m unittest discover -s tests -v
 
 既定処理はAPIを呼ばず、限定的なローカル短縮規則を適用します。自由な言い換えは別途候補入力で比較します。候補の意味と実音声の長さはレビューが必要です。異なる既存出力は上書きしません。
 
+## TTS Feedback Engine（Phase 2）
+
+`tts_generator.py --script` で最適化台本からプリセットWAVを生成し、サンプル数による実測、推定誤差、時間超過、同一話者の衝突、声別の校正データを保存できます。既存Qwen環境とモデルキャッシュを使い、UNKNOWNは未確定のまま記録します。既存台本・旧WAVは変更しません。
+
+```bash
+~/Documents/techclipsjp/Qwen3-TTS-MLX/.venv/bin/python tts_generator.py VIDEO_ID \
+  --script input/VIDEO_ID/dubbing_script.json --seconds 30
+```
+
+[docs/TTS_FEEDBACK.md](docs/TTS_FEEDBACK.md) にオフライン実行、再開、旧WAV比較、候補再評価、校正、再生方法を記載しています。
+
 ## 次の開発課題
 
 - 言語エンジンの数詞・助数詞・意味保持検査を拡充する。
 - 台本候補の生成プロバイダを接続し、短縮案の聴取・意味確認を進める。
-- Qwen3-TTSのWAV実測長を利用し、発話時間を反復的に改善する。
+- TTSフィードバックの校正標本を増やし、短縮候補を実測・聴取で反復評価する。
 - `UNKNOWN`・同時発話を確認し、正しい話者へ割り当てるためのレビュー手段を作る。
 - 適切な権利・許可がある場合に限り、参照音声による声質再現を検証する。
 - 日本語WAVを配置・ミックスし、最終MP4を生成する処理をCLIに接続する。

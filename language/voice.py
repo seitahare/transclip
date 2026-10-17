@@ -1,4 +1,4 @@
-"""Future TTS boundary. This module generates no audio."""
+"""Replaceable TTS boundary. The Qwen adapter lives in tts_generator.py."""
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -21,6 +21,8 @@ class VoiceProfile:
 
 
 class SpeechSynthesizer(Protocol):
+    identity: dict  # Model revision, backend version and generation settings.
+
     def synthesize(self, *, text: str, profile: VoiceProfile, output_path: str) -> dict:
         """Return path and actual duration. Never truncate to another turn's start."""
         ...

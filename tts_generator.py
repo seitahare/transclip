@@ -346,7 +346,88 @@ def generate_audio(video_id, seconds, max_jobs, dry_run, model_id):
     print(f"Manifest: {manifest_path}")
 
 
-def main():
+class QwenPresetSynthesizer:
+    """Offline, lazily loaded Qwen adapter implementing SpeechSynthesizer.
+
+    All generation settings and the cached model revision enter the audio key.
+    No package installation, download, voice cloning or speed control occurs.
+    """
+    def __init__(self, model_id=DEFAULT_MODEL, *, seed=0):
+        import os
+        from importlib.metadata import version
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        from huggingface_hub import snapshot_download
+        from language.cache import fingerprint
+        if type(seed) is not int or not 0 <= seed < 2**32:
+            raise ValueError("seed must be an unsigned 32-bit integer.")
+        # A missing cache fails here, before any attempt to load the model.
+        self.snapshot = Path(snapshot_download(
+            model_id, local_files_only=True,
+            allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model", "*.tiktoken", "*.jinja"]))
+        required = [self.snapshot / "config.json", self.snapshot / "speech_tokenizer/config.json"]
+        if not all(p.is_file() for p in required) or not list(self.snapshot.glob("*.safetensors")) or not list((self.snapshot / "speech_tokenizer").glob("*.safetensors")):
+            raise ValueError("Incomplete cached model. Download requires separate approval.")
+        config = json.loads(required[0].read_text())
+        if config.get("tts_model_type") != "custom_voice":
+            raise ValueError("Phase 2 supports preset CustomVoice models only.")
+        files = []
+        for p in sorted(self.snapshot.rglob("*")):
+            if p.is_file():
+                # HF snapshots reference immutable content-addressed blobs.
+                files.append({"name": str(p.relative_to(self.snapshot)), "blob": p.resolve().name,
+                              "size": p.stat().st_size,
+                              "small_file_sha256": hashlib.sha256(p.read_bytes()).hexdigest() if p.stat().st_size < 10_000_000 else None})
+        self.settings = {"language": "Japanese", "seed": seed, "temperature": .9,
+                         "max_tokens": 4096, "top_k": 50, "top_p": 1.0,
+                         "repetition_penalty": 1.05, "instruct": None,
+                         "stream": False, "verbose": False, "wav_subtype": "PCM_16"}
+        self.identity = {"backend": "qwen3-tts-mlx", "adapter_version": 1, "model": model_id,
+                         "model_revision": self.snapshot.name, "model_files_fingerprint": fingerprint(files),
+                         "versions": {name: version(name) for name in
+                                      ("qwen3-tts-mlx", "mlx-audio", "mlx", "numpy", "soundfile", "transformers")},
+                         "settings": dict(self.settings)}
+        # Editable backend code can change without a package-version bump.
+        from importlib.util import find_spec
+        package = Path(find_spec("qwen_tts_mlx").origin).parent
+        self.identity["backend_source_fingerprint"] = fingerprint({
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in package.glob("*.py")})
+        self._model = None
+
+    def synthesize(self, *, text, profile, output_path):
+        import numpy as np
+        import mlx.core as mx
+        import soundfile as sf
+        from qwen_tts_mlx import MLXQwen3TTS
+        if profile.mode != "preset" or profile.reference_audio or not profile.voice:
+            raise ValueError("Only explicit preset voices are allowed in this adapter.")
+        if self._model is None:
+            print("Loading cached Qwen3-TTS model (offline)...", flush=True)
+            self._model = MLXQwen3TTS.from_pretrained(str(self.snapshot))
+        mx.random.seed(self.settings["seed"])
+        options = {k: v for k, v in self.settings.items() if k not in ("seed", "wav_subtype")}
+        # The facade discards token counts. Retain native results to detect the
+        # generation limit, rather than reporting truncated speech as complete.
+        results = list(self._model.model.generate_custom_voice(text=text, speaker=profile.voice, **options))
+        if not results:
+            raise RuntimeError("Qwen returned no audio.")
+        rates = {r.sample_rate for r in results}
+        if len(rates) != 1 or any(r.token_count >= self.settings["max_tokens"] for r in results):
+            raise RuntimeError("Inconsistent sample rates or token limit reached; audio not published.")
+        wav = np.concatenate([np.asarray(r.audio) for r in results])
+        if wav.ndim != 1 or not wav.size or not np.isfinite(wav).all():
+            raise ValueError("Qwen returned empty, non-mono or non-finite samples.")
+        rate = int(next(iter(rates)))
+        if rate <= 0:
+            raise ValueError("Qwen returned invalid sample rate.")
+        sf.write(output_path, wav, rate, subtype="PCM_16", format="WAV")
+        return {"sample_rate": rate, "sample_frames": int(wav.size),
+                "token_count": sum(r.token_count for r in results),
+                "termination": "eos_before_limit", "preset": profile.voice,
+                "processing_seconds": sum(r.processing_time_seconds for r in results)}
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate Japanese speech with Qwen3-TTS"
     )
@@ -379,7 +460,13 @@ def main():
         help="Qwen3-TTS MLX CustomVoice model ID",
     )
 
-    args = parser.parse_args()
+    parser.add_argument("--script", type=Path, help="Use dubbing_script.json (Phase 2)")
+    parser.add_argument("--feedback-dir", type=Path, help="Separate audio cache and feedback directory")
+    parser.add_argument("--baseline-manifest", type=Path, help="Read-only comparison with legacy WAVs")
+    parser.add_argument("--voice-map", type=Path, help="JSON mapping known speakers to preset voices")
+    parser.add_argument("--entry-id", action="append", help="Limit generation to explicit script entry IDs")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args(argv)
 
     try:
         if args.seconds <= 0:
@@ -387,6 +474,35 @@ def main():
                 "seconds must be positive."
             )
 
+        if args.script:
+            from tts_feedback import plan_script, run_feedback
+            voices = json.loads(args.voice_map.read_text()) if args.voice_map else SPEAKER_VOICES
+            script = json.loads(args.script.read_text())
+            if script.get("video_id") != args.video_id:
+                raise ValueError("Requested video_id does not match the script.")
+            if Path(args.video_id).name != args.video_id or args.video_id in {".", ".."}:
+                raise ValueError("video_id must be a directory name.")
+            selection_path = args.script.parent / "selection.json"
+            if selection_path.exists():
+                selection = json.loads(selection_path.read_text())
+                if any(abs(selection[k] - script["clip"][k]) > .01 for k in ("start", "end")):
+                    raise ValueError("Script does not match current selection.json.")
+            if args.max_jobs is not None and args.max_jobs <= 0:
+                raise ValueError("max_jobs must be positive.")
+            plan = plan_script(script, voices, seconds=args.seconds, entry_ids=args.entry_id)
+            if args.dry_run:
+                for row in plan:
+                    print(row["id"], row["speaker"] or "UNKNOWN", row["voice"],
+                          row["generation_status"], row["skip_reason"] or "")
+                print("Dry run: no model loaded, downloaded, or synthesized.")
+                return 0
+            backend = QwenPresetSynthesizer(args.model, seed=args.seed)
+            run_feedback(args.script, args.feedback_dir or OUTPUT_DIR / args.video_id / "tts_feedback",
+                         backend, voices, seconds=args.seconds, max_jobs=args.max_jobs,
+                         entry_ids=args.entry_id, baseline_manifest=args.baseline_manifest)
+            return 0
+        if args.feedback_dir or args.baseline_manifest or args.voice_map or args.entry_id:
+            raise ValueError("Feedback options require --script.")
         generate_audio(
             video_id=args.video_id,
             seconds=args.seconds,
