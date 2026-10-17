@@ -56,9 +56,9 @@ clipper.py ──► output/<video_id>/clip_<start>_<end>.mp4
        └─► dubbing_script.json + timing diagnostics
                   └─► tts_generator.py --script / tts_feedback.py
                          └─► 話者別WAV / feedback.json / 校正用標本
+                                └─► audio_mixer.py ──► 話者別トラック / mix_report.json / 診断用MP4
 [計画中]
   approved_voice_profile/* ──────► speaker-aware TTS (権利確認後)
-  audio_mixer.py ────────────────► dubbed_<range>.mp4
 ```
 
 ※矢印は概念上の依存関係です。全ステージが単一CLIで連続実行されるわけではありません。入力動画の拡張子は現実には `mp4` 以外の場合もあり、`clipper.py` の現行実装は `source.mp4` を前提とします。
@@ -239,3 +239,11 @@ python -m unittest discover -s tests -v
 ## 10. Phase 2: TTS Feedback Engine（実装済み）
 
 `tts_generator.py --script` を独立したQwen環境で実行し、`tts_feedback.py` が入力検証・WAV/receiptキャッシュ・再開・実測比較・衝突・校正を管理します。元の台本、旧manifest、旧WAVを保持した別出力です。UNKNOWNは生成せず記録し、別話者の重なりを直列化しません。校正は話者・モデル・音声設定ごとに分離し、自動適用しません。詳細は [TTS_FEEDBACK.md](TTS_FEEDBACK.md) を参照してください。
+
+## 11. Phase 3: Audio Mixer（実装済み）
+
+独立CLI `audio_mixer.py` がPhase 2のWAVを再測定・来歴照合し、`relative_start` を48kHzサンプルへ変換して話者別タイムラインに配置します。元動画は `selection.start` から切り出します。FFmpegによるリサンプル・遅延・話者別ミックス、共通の固定ゲイン、H.264/AACへの結合を行います。WAVの切断・倍速化・話者の直列化は行いません。
+
+通常モードは同一話者衝突・未吹き替え・未解決レビューで停止。`--diagnostic` でのみ未解決状態を明示した部分プレビューを生成します。UNKNOWNと上流除外をレポートに残します。日本語のみ／英語を小音量で残す比較モードがあり、音声分離とは区別します。
+
+プレビュー終端を越える音声は停止し、明示的な延長でも選択区間を越えません。入力を変更せず、検証済みの成果物一式を別ディレクトリへアトミックに保存します。全デコード・ストリーム・時間・ピーク・再実行のハッシュ確認を実装しました。詳細は [AUDIO_MIXER.md](AUDIO_MIXER.md)。メインCLIへの一括接続と完成品質への調整は今後の課題です。

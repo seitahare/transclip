@@ -175,6 +175,17 @@ python -m unittest discover -s tests -v
 
 [docs/TTS_FEEDBACK.md](docs/TTS_FEEDBACK.md) にオフライン実行、再開、旧WAV比較、候補再評価、校正、再生方法を記載しています。
 
+## Audio Mixer（Phase 3）
+
+`audio_mixer.py` が Phase 2 の既存WAVを相対開始時刻へ配置し、話者別トラック、日本語音声、H.264/AAC MP4、配置レポートを作ります。日本語のみ／小音量の英語を残す比較モードを選べます。同一話者の衝突や未生成・未レビュー項目があれば通常モードは停止し、`--diagnostic` 指定時だけ問題を残した部分プレビューを生成します。
+
+```bash
+.venv/bin/python audio_mixer.py VIDEO_ID --feedback /path/to/feedback.json --dry-run
+.venv/bin/python audio_mixer.py VIDEO_ID --feedback /path/to/feedback.json --diagnostic
+```
+
+詳細・実データの実行例・再生方法は [docs/AUDIO_MIXER.md](docs/AUDIO_MIXER.md) を参照してください。新しいTTSやAPIは実行しません。
+
 ## 次の開発課題
 
 - 言語エンジンの数詞・助数詞・意味保持検査を拡充する。
@@ -182,7 +193,7 @@ python -m unittest discover -s tests -v
 - TTSフィードバックの校正標本を増やし、短縮候補を実測・聴取で反復評価する。
 - `UNKNOWN`・同時発話を確認し、正しい話者へ割り当てるためのレビュー手段を作る。
 - 適切な権利・許可がある場合に限り、参照音声による声質再現を検証する。
-- 日本語WAVを配置・ミックスし、最終MP4を生成する処理をCLIに接続する。
+- 診断用MP4の聴取結果を使って衝突と未吹き替えを解消し、Audio MixerをメインCLIへ接続する。
 
 実装状態や具体的なデータ契約は [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) を参照してください。
 
