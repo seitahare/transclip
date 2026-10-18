@@ -96,6 +96,7 @@ class MixerTests(unittest.TestCase):
         self.assertEqual(p["same_speaker_conflicts"][0]["entry_ids"], ["dub-1", "dub-3"])
         self.assertAlmostEqual(p["same_speaker_conflicts"][0]["overlap_seconds"], .3)
         self.assertEqual(len(p["other_speaker_overlaps"]),2)
+        self.assertEqual([x["entry_ids"] for x in p["introduced_other_speaker_overlaps"]], [["dub-2", "dub-3"]])
         self.assertEqual([r["relative_start"] for r in p["placements"]], [.5,.7,1])
 
     def test_unknown_preserved_and_incomplete_mode_blocked(self):

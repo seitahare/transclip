@@ -352,6 +352,8 @@ class QwenPresetSynthesizer:
     All generation settings and the cached model revision enter the audio key.
     No package installation, download, voice cloning or speed control occurs.
     """
+    supported_voice_modes = {"preset"}
+
     def __init__(self, model_id=DEFAULT_MODEL, *, seed=0):
         import os
         from importlib.metadata import version
@@ -461,6 +463,7 @@ def main(argv=None):
     )
 
     parser.add_argument("--script", type=Path, help="Use dubbing_script.json (Phase 2)")
+    parser.add_argument("--speaker-profiles", type=Path, help="Attach Phase 4 voice analysis to preset synthesis")
     parser.add_argument("--feedback-dir", type=Path, help="Separate audio cache and feedback directory")
     parser.add_argument("--baseline-manifest", type=Path, help="Read-only comparison with legacy WAVs")
     parser.add_argument("--voice-map", type=Path, help="JSON mapping known speakers to preset voices")
@@ -473,6 +476,9 @@ def main(argv=None):
             raise ValueError(
                 "seconds must be positive."
             )
+
+        if args.speaker_profiles and not args.script:
+            raise ValueError("--speaker-profiles requires --script.")
 
         if args.script:
             from tts_feedback import plan_script, run_feedback
@@ -490,6 +496,17 @@ def main(argv=None):
             if args.max_jobs is not None and args.max_jobs <= 0:
                 raise ValueError("max_jobs must be positive.")
             plan = plan_script(script, voices, seconds=args.seconds, entry_ids=args.entry_id)
+            profile_document = None
+            if args.speaker_profiles:
+                from language.voice import ProfiledPresetSynthesizer, profile_for_synthesis
+                profile_document = json.loads(args.speaker_profiles.read_text())
+                # Validate before the dry-run return or loading any Qwen assets.
+                if profile_document.get("video_id") != args.video_id or profile_document.get("clip") != script["clip"]:
+                    raise ValueError("Voice profiles do not match synthesis video/clip.")
+                for row in plan:
+                    if row["generation_status"] != "skipped":
+                        profile_for_synthesis(profile_document, row["speaker"], preset=row["voice"])
+
             if args.dry_run:
                 for row in plan:
                     print(row["id"], row["speaker"] or "UNKNOWN", row["voice"],
@@ -497,6 +514,8 @@ def main(argv=None):
                 print("Dry run: no model loaded, downloaded, or synthesized.")
                 return 0
             backend = QwenPresetSynthesizer(args.model, seed=args.seed)
+            if profile_document is not None:
+                backend = ProfiledPresetSynthesizer(backend, profile_document, video_id=args.video_id, clip=script["clip"])
             run_feedback(args.script, args.feedback_dir or OUTPUT_DIR / args.video_id / "tts_feedback",
                          backend, voices, seconds=args.seconds, max_jobs=args.max_jobs,
                          entry_ids=args.entry_id, baseline_manifest=args.baseline_manifest)

@@ -166,6 +166,45 @@ def overlap_pairs(rows, field):
     return pairs
 
 
+def attach_speaker_evidence(plan, analysis_path):
+    """Cross-check Phase 4 assignments; never relabel already generated WAVs."""
+    path = Path(analysis_path).resolve()
+    analysis = read_json(path)
+    if (analysis.get("kind") != "speaker_analysis" or analysis.get("format_version") != 1
+            or analysis.get("video_id") != plan["video_id"] or analysis.get("clip") != plan["clip"]):
+        raise ValueError("Speaker analysis video/clip/format mismatch.")
+    utterance_path = (path.parent / analysis.get("utterances_file", "utterances.enhanced.json")).resolve()
+    if not utterance_path.is_relative_to(path.parent):
+        raise ValueError("Speaker utterance path escapes analysis directory.")
+    utterances = read_json(utterance_path)
+    if utterances.get("video_id") != plan["video_id"] or utterances.get("clip") != plan["clip"]:
+        raise ValueError("Speaker utterance video/clip mismatch.")
+    indexed = {r["id"]: r for r in utterances["utterances"]}
+    if len(indexed) != len(utterances["utterances"]):
+        raise ValueError("Duplicate speaker utterance IDs.")
+    conflicts = []
+    for row in plan["placements"]:
+        for uid in row["source_utterance_ids"]:
+            if uid not in indexed:
+                raise ValueError("Missing source utterance in speaker analysis.")
+            proposed = indexed[uid]
+            if not (row["relative_start"] <= proposed["relative_start"] < proposed["relative_end"] <= row["relative_end"] + .001):
+                raise ValueError("Speaker evidence source interval mismatch.")
+            if proposed["speaker"] != row["speaker"]:
+                conflicts.append({"entry_id": row["id"], "source_utterance_id": uid,
+                                  "tts_speaker": row["speaker"], "analyzed_speaker": proposed["speaker"]})
+    plan["speaker_evidence"] = {"analysis_key": analysis.get("analysis_key"), "assignment_conflicts": conflicts,
+                                "source_overlap_regions": analysis.get("source_overlap_regions", []),
+                                "policy": "Regenerate script/feedback after speaker changes; cached WAVs are not relabeled."}
+    plan["inputs"]["speaker_analysis"] = str(path)
+    plan["inputs"]["speaker_analysis_fingerprint"] = fingerprint(analysis)
+    plan["inputs"]["speaker_utterances"] = str(utterance_path)
+    plan["inputs"]["speaker_utterances_fingerprint"] = fingerprint(utterances)
+    if conflicts:
+        plan["blockers"].append("speaker_assignment_changed_regenerate_script_and_feedback")
+    return plan
+
+
 def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *, seconds=30,
                mode="japanese-only", diagnostic=False, extend_to_fit=False, reference_gain=.12):
     number(seconds, "seconds", positive=True)
@@ -227,6 +266,7 @@ def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *
         if same: blockers.append("unresolved_same_speaker_collisions")
         if missing or excluded: blockers.append("undubbed_source_intervals")
         if review_ids: blockers.append("unresolved_entry_reviews")
+        if any(p["source_overlap_seconds"] <= 0 for p in other): blockers.append("introduced_other_speaker_overlap")
     quality = "diagnostic" if diagnostic else "reviewed"
     if same: quality += "_conflicts"
     if missing or excluded: quality += "_partial"
@@ -241,6 +281,7 @@ def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *
             "placements": complete, "undubbed_entries": missing,
             "source_excluded": feedback.get("source_excluded", []), "excluded_intersecting_preview": excluded,
             "same_speaker_conflicts": same, "other_speaker_overlaps": other,
+            "introduced_other_speaker_overlaps": [p for p in other if p["source_overlap_seconds"] <= 0],
             "review_entry_ids": review_ids, "boundary_crossing_ids": overflows,
             "extended": duration > seconds, "blockers": blockers,
             "inputs": {"feedback": str(Path(feedback_path).resolve()), "feedback_fingerprint": fingerprint(feedback),
@@ -384,7 +425,7 @@ def render_plan(plan, output_dir):
             for row in plan["placements"]:
                 if sha256_file(row["audio_file"]) != row["wav_measurement"]["sha256"]:
                     raise ValueError("Source WAV changed during rendering.")
-            for label in ("feedback", "selection", "script", "source_info"):
+            for label in ("feedback", "selection", "script", "source_info", *(["speaker_analysis", "speaker_utterances"] if "speaker_analysis" in plan["inputs"] else [])):
                 if fingerprint(read_json(plan["inputs"][label])) != plan["inputs"][label + "_fingerprint"]:
                     raise ValueError(f"Input {label} changed during rendering.")
             result = {**plan, "mix_key": key, "status": "diagnostic_preview" if plan["diagnostic"] else "rendered",
@@ -404,6 +445,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Place Phase 2 WAVs on independent timelines and render a dubbed preview.")
     parser.add_argument("video_id")
     parser.add_argument("--feedback", type=Path, required=True)
+    parser.add_argument("--speaker-analysis", type=Path, help="Cross-check Phase 4 speaker evidence before mixing")
     parser.add_argument("--selection", type=Path)
     parser.add_argument("--source-video", type=Path)
     parser.add_argument("--source-info", type=Path)
@@ -422,6 +464,8 @@ def main(argv=None):
                           args.source_video or inputs / "source.mp4", args.source_info or inputs / "source.info.json",
                           args.video_id, seconds=args.seconds, mode=args.mode, diagnostic=args.diagnostic,
                           extend_to_fit=args.extend_to_fit, reference_gain=args.reference_gain)
+        if args.speaker_analysis:
+            attach_speaker_evidence(plan, args.speaker_analysis)
         print(json.dumps({k: plan[k] for k in ("video_id", "quality_label", "duration_seconds", "same_speaker_conflicts",
                           "other_speaker_overlaps", "boundary_crossing_ids", "excluded_intersecting_preview", "blockers")}, ensure_ascii=False, indent=2))
         for row in plan["placements"]:

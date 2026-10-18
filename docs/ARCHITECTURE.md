@@ -247,3 +247,11 @@ python -m unittest discover -s tests -v
 通常モードは同一話者衝突・未吹き替え・未解決レビューで停止。`--diagnostic` でのみ未解決状態を明示した部分プレビューを生成します。UNKNOWNと上流除外をレポートに残します。日本語のみ／英語を小音量で残す比較モードがあり、音声分離とは区別します。
 
 プレビュー終端を越える音声は停止し、明示的な延長でも選択区間を越えません。入力を変更せず、検証済みの成果物一式を別ディレクトリへアトミックに保存します。全デコード・ストリーム・時間・ピーク・再実行のハッシュ確認を実装しました。詳細は [AUDIO_MIXER.md](AUDIO_MIXER.md)。メインCLIへの一括接続と完成品質への調整は今後の課題です。
+
+## 12. Phase 4: 話者解析・声質プロフィール（実装済み）
+
+`voice_profiler.py` / `speaker_refinement.py` が既存pyannoteのsegmentation・embedding・PLDAをローカルキャッシュから読み、全選択範囲を話者数自動で解析します。新旧の非重複区間の埋め込みを照合してIDを維持し、窓ごとの類似度・境界とASRの矛盾を保存します。原本JSONや同時発話を削除せず、未知発話の自動確定を避けます。
+
+`speaker_profiles.json` は波形測定、DSP推定、ASR推定、モデル埋め込みを分離し、品質評価付き参考候補を持ちます。`speaker_review.py` のHTMLで音声を聞き比べ、人間の判断と文字起こし修正を別JSONへ保存・検証取込できます。
+
+`language/voice.py` でPreset / Voice Design / Approved Cloneの契約を区別。現行QwenはPresetのみで、解析を添付できるものの声質再現は行いません。`audio_mixer.py --speaker-analysis` は話者変更に対して既存WAVの付け替えを禁止し、元の区間にない別話者の重なりも分類します。詳細は [SPEAKER_PROFILES.md](SPEAKER_PROFILES.md)。実モデルの精度向上は人手正解ラベルなしには主張しません。

@@ -186,6 +186,16 @@ python -m unittest discover -s tests -v
 
 詳細・実データの実行例・再生方法は [docs/AUDIO_MIXER.md](docs/AUDIO_MIXER.md) を参照してください。新しいTTSやAPIは実行しません。
 
+## 話者解析と声質プロフィール（Phase 4）
+
+`voice_profiler.py` が既存pyannoteモデルをオフラインで再利用し、全選択範囲の話者埋め込み・F0等の特徴・参考WAV・話者確認HTMLを生成します。UNKNOWNの発話は人間確認まで保持し、実名やClone許可を推測しません。Preset / Voice Design / 許可済みCloneの契約を分離し、Mixerでは話者変更後の古いWAVの流用を止めます。
+
+```bash
+.venv-diarize/bin/python voice_profiler.py VIDEO_ID
+```
+
+[docs/SPEAKER_PROFILES.md](docs/SPEAKER_PROFILES.md) に入力、特徴の測定／推定の区別、確認結果の保存、TTS/Mixerへの接続と制約を記載しています。実際の精度向上は人手の正解確認後に評価します。
+
 ## 次の開発課題
 
 - 言語エンジンの数詞・助数詞・意味保持検査を拡充する。
