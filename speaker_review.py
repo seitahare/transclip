@@ -33,7 +33,8 @@ def build_review(folder,analysis,utterances,profiles,samples,original):
                         'reason':row['review_reasons'],'words':row['words'],'audio_file':name,'exact_audio_file':exact,
                         'context_start':left,'context_end':right,'audio_sha256':sha256_file(folder/name),
                         'focus':row['text_en'].strip().lower() in [s.lower() for s in FOCUS],
-                        'acoustic_evidence_unavailable_reason':row.get('acoustic_evidence_unavailable_reason')})
+                        'acoustic_evidence_unavailable_reason':row.get('acoustic_evidence_unavailable_reason'),
+                        **({'attribution':row['attribution']} if 'attribution' in row else {})})
     bundle={'format_version':1,'kind':'speaker_review','analysis_key':analysis['analysis_key'],
             'video_id':analysis['video_id'],'clip':analysis['clip'],'speakers':analysis['speakers'],
             'original_utterances_fingerprint':fingerprint(original),'items':records,
@@ -45,15 +46,33 @@ def build_review(folder,analysis,utterances,profiles,samples,original):
     cards=[]
     for row in sorted(records,key=lambda r:(not r['focus'],r['original_speaker'] is not None,r['relative_start'])):
         uid=row['utterance_id'];esc=html.escape
-        options='<option value="">未確認・変更しない</option><option value="UNKNOWN">UNKNOWNを維持</option>'+''.join(f'<option>{esc(s)}</option>' for s in analysis['speakers'])
+        options='<option value="">未確認・変更しない</option><option value="UNKNOWN">UNKNOWN</option><option value="MIXED">複数話者の混在</option>'+''.join(f'<option>{esc(s)}</option>' for s in analysis['speakers'])
         scores=', '.join(f"{c['speaker_id']}: {c['cosine_similarity']:.3f}" for c in row['candidates']) or '独立した埋め込み候補なし（短すぎる／重なりなど）'
         temporal=', '.join(f"{c['speaker']}: {c['coverage']:.1%} / {c['overlap_seconds']:.3f}秒" for c in row['temporal_candidates']) or '対応する話者区間なし'
         word_evidence='\n'.join(f"{w['word']}: {w.get('speaker')} | {w.get('assignment_method')} | {', '.join(w.get('review_reasons',[]))}" for w in row['words'])
+        attribution_details=''
+        if row.get('attribution'):
+            evidence=row['attribution']
+            auto=evidence['automatic']; human=evidence['human_confirmation']
+            auto_label=auto['speaker_id'] or ('複数話者の混在（モデル推定）' if auto['status']=='mixed' else 'UNKNOWN')
+            attribution_details='<p><strong>新しい自動判定: '+esc(auto_label)+'</strong> / '+esc(auto['method'])+'</p>'
+            attribution_details+='<p>人間の確認: '+esc(json.dumps(human,ensure_ascii=False) if human is not None else '未確認')+'</p>'
+            attribution_details+='<p>同時発話・境界の見立て: '+esc(', '.join(auto['overlap']['hypotheses']) or '強い混在根拠なし')+'</p>'
+            attribution_details+='<p>次の値は未校正です。混在票は同じpyannoteモデルの推定であり、同時発話の正解確率ではありません。</p><table><tr><th>音響窓</th><th>時刻</th><th>候補の類似度</th><th>混在票</th></tr>'
+            for w in evidence['windows']:
+                candidates=', '.join(f"{c['speaker_id']}: {c['cosine_similarity']:.3f}" for c in w['candidates']) or '短すぎるため取得せず'
+                vote=w['activity']['overlap_vote']
+                attribution_details+=f"<tr><td>{esc(w['scope'])}</td><td>{w['relative_start']:.2f}–{w['relative_end']:.2f}</td><td>{esc(candidates)}</td><td>{vote:.3f}</td></tr>" if vote is not None else f"<tr><td>{esc(w['scope'])}</td><td>音響情報不足</td><td>{esc(candidates)}</td><td>不明</td></tr>"
+            attribution_details+='</table>'
+            concise={k:v for k,v in evidence.items() if k not in ('duration_reference_checks','windows')}
+            concise['windows']=[{k:v for k,v in w.items() if k!='embedding'} for w in evidence['windows']]
+            attribution_details+='<details><summary>特徴・しきい値・前後の会話・判断根拠</summary><pre>'+esc(json.dumps(concise,ensure_ascii=False,indent=2))+'</pre></details>'
         cards.append(f'''<article class="{'focus' if row['focus'] else ''}"><small>発話 {uid} · {row['relative_start']:.2f}–{row['relative_end']:.2f}秒 {'· 重点確認' if row['focus'] else ''}</small>
 <h2>{esc(row['text_en'])}</h2><p>以前: {esc(str(row['original_speaker'] or 'UNKNOWN'))} / 現在: {esc(str(row['speaker'] or 'UNKNOWN'))} / 単語からの候補: {esc(str(row['proposed_speaker'] or 'なし'))}</p>
 <p>対象そのもの</p><audio controls preload="none" src="{row['exact_audio_file']}"></audio><p>前後0.65秒の文脈を含む音声（別話者を含む可能性あり）</p><audio controls preload="none" src="{row['audio_file']}"></audio>
 <p>時間の重なりによる候補（確率ではありません）: {esc(temporal)}</p><p>音響類似度（確率ではありません）: {esc(scores)}</p><p class="reason">{esc(', '.join(row['reason']))}</p>
 <details><summary>単語ごとの根拠と矛盾</summary><pre>{esc(word_evidence)}</pre></details>
+{attribution_details}
 <label>確認結果 <select data-uid="{uid}">{options}</select></label><label>判断の根拠 <input data-note="{uid}" placeholder="聞き比べた特徴や残る疑問"></label></article>''')
     refs=[]
     for r in bundle['reference_candidates']:
@@ -70,7 +89,7 @@ def build_review(folder,analysis,utterances,profiles,samples,original):
 const data='''+payload+''';
 document.querySelector('#download').onclick=()=>{
  const reviewer=document.querySelector('#reviewer').value.trim();if(!reviewer){document.querySelector('#status').textContent='確認者を入力してください';return;}
- const decisions=[...document.querySelectorAll('select[data-uid]')].filter(x=>x.value).map(x=>{const id=Number(x.dataset.uid),item=data.items.find(r=>r.utterance_id===id);return {utterance_id:id,speaker:x.value==='UNKNOWN'?null:x.value,audio_sha256:item.audio_sha256,note:document.querySelector(`[data-note="${id}"]`).value.trim()};});
+ const decisions=[...document.querySelectorAll('select[data-uid]')].filter(x=>x.value).map(x=>{const id=Number(x.dataset.uid),item=data.items.find(r=>r.utterance_id===id);return {utterance_id:id,speaker:['UNKNOWN','MIXED'].includes(x.value)?null:x.value,attribution_status:x.value==='MIXED'?'mixed':x.value==='UNKNOWN'?'unknown':'single',audio_sha256:item.audio_sha256,note:document.querySelector(`[data-note="${id}"]`).value.trim()};});
  const reference_edits=[...document.querySelectorAll('textarea[data-ref]')].filter(x=>x.value.trim()).map(x=>{const ref=data.reference_candidates.find(r=>r.reference_id===x.dataset.ref);return {reference_id:ref.reference_id,audio_sha256:ref.audio_sha256,corrected_text:x.value.trim()};});
  const result={format_version:1,analysis_key:data.analysis_key,review_key:data.review_key,reviewed_by:reviewer,reviewed_at:new Date().toISOString(),decisions,reference_edits};
  const url=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download='speaker_review_decisions.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);document.querySelector('#status').textContent=`${decisions.length}件の判断・${reference_edits.length}件の文字起こし修正を保存`;
@@ -91,7 +110,11 @@ def validate_decisions(bundle,decisions):
         uid=d.get('utterance_id')
         if uid in seen or uid not in items: raise ValueError('Duplicate/unknown review utterance ID.')
         seen.add(uid)
+        if 'speaker' not in d: raise ValueError('Reviewed speaker must be explicit.')
         if d.get('speaker') is not None and d['speaker'] not in bundle['speakers']: raise ValueError('Invalid reviewed speaker ID.')
+        status=d.get('attribution_status', 'unknown' if d['speaker'] is None else 'single')
+        if status not in ('single','mixed','unknown') or (status=='single') != (d['speaker'] is not None):
+            raise ValueError('Inconsistent human attribution status.')
         if d.get('audio_sha256')!=items[uid]['audio_sha256']: raise ValueError('Review audio hash mismatch.')
         if not isinstance(d.get('note'),str): raise ValueError('Review note must be text.')
     refs={r['reference_id']:r for r in bundle['reference_candidates']};seen=set()
@@ -107,7 +130,8 @@ def validate_decisions(bundle,decisions):
 def apply_review(analysis_dir,decisions_path,input_dir,output_dir):
     folder=Path(analysis_dir).resolve();inputs=Path(input_dir).resolve();target=Path(output_dir).resolve()
     bundle=read_json(folder/'speaker_review.json');decisions=validate_decisions(bundle,read_json(decisions_path))
-    analysis=read_json(folder/'diarization.enhanced.json')
+    analysis_path=folder/('speaker_timeline.json' if (folder/'speaker_attribution.json').exists() else 'diarization.enhanced.json')
+    analysis=read_json(analysis_path)
     source=read_json(inputs/'utterances.json');translated=read_json(inputs/'utterance_translations.json')
     selection=read_json(inputs/'selection.json')
     if (fingerprint(source)!=bundle['original_utterances_fingerprint'] or fingerprint(translated)!=analysis['input_fingerprints']['utterance_translations']
@@ -116,17 +140,27 @@ def apply_review(analysis_dir,decisions_path,input_dir,output_dir):
         path=(folder/r['audio_file']).resolve()
         if not path.is_relative_to(folder) or sha256_file(path)!=r['audio_sha256']: raise ValueError('Review audio changed.')
     updates={d['utterance_id']:d for d in decisions.get('decisions',[])}
+    # Preserve Phase 5 automatic results for items not explicitly reviewed.
+    if analysis.get('attribution_file'):
+        from speaker_attribution import verify_bundle
+        verify_bundle(folder)
+        source=read_json(folder/'utterances.json');translated=read_json(folder/'utterance_translations.json')
     # Source utterance IDs/text/timing stay unchanged. Translation is not regenerated.
     for row in source['utterances']:
         if row['id'] not in updates: continue
         d=updates[row['id']];row['speaker']=d['speaker']
-        row['human_review']={'reviewed_by':decisions['reviewed_by'],'note':d['note'],'analysis_key':bundle['analysis_key']}
+        row['attribution_status']=d.get('attribution_status','unknown' if d['speaker'] is None else 'single')
+        row['attribution_method']='human_review'
+        row['human_review']={'reviewed_by':decisions['reviewed_by'],'note':d['note'],'analysis_key':bundle['analysis_key'],'attribution_status':row['attribution_status']}
         row['review_required']=True  # Meaning, timing and other inherited concerns remain unresolved.
         row['review_reasons']=sorted(set(row.get('review_reasons',[])+['human_speaker_review_recorded']))
         for word in row['words']:
             word['speaker']=d['speaker'];word['assignment_method']='human_review';word['review_required']=True
     for row in translated['utterances']:
-        if row['id'] in updates: row['speaker']=updates[row['id']]['speaker'];row['review_required']=True
+        if row['id'] in updates:
+            d=updates[row['id']];row['speaker']=d['speaker'];row['review_required']=True
+            row['attribution_status']=d.get('attribution_status','unknown' if d['speaker'] is None else 'single')
+            row['attribution_method']='human_review'
     source['cache_key']=fingerprint(source['utterances']);translated['cache_key']=fingerprint(translated['utterances'])
     profiles=read_json(folder/'speaker_profiles.json');edits={d['reference_id']:d for d in decisions.get('reference_edits',[])}
     for p in profiles['profiles']:

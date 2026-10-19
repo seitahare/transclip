@@ -255,3 +255,12 @@ python -m unittest discover -s tests -v
 `speaker_profiles.json` は波形測定、DSP推定、ASR推定、モデル埋め込みを分離し、品質評価付き参考候補を持ちます。`speaker_review.py` のHTMLで音声を聞き比べ、人間の判断と文字起こし修正を別JSONへ保存・検証取込できます。
 
 `language/voice.py` でPreset / Voice Design / Approved Cloneの契約を区別。現行QwenはPresetのみで、解析を添付できるものの声質再現は行いません。`audio_mixer.py --speaker-analysis` は話者変更に対して既存WAVの付け替えを禁止し、元の区間にない別話者の重なりも分類します。詳細は [SPEAKER_PROFILES.md](SPEAKER_PROFILES.md)。実モデルの精度向上は人手正解ラベルなしには主張しません。
+
+
+## Phase 5: Speaker Attribution Refinement
+
+`speaker_attribution.py` をPhase 4と台本生成の間に任意で追加する。既存の参考窓・埋め込み・音響特徴・レビュー保存を再利用する。対象と文脈音声に重なる参考を除き、複数窓の埋め込み、音質、F0、segmentationの発話人数を比較する。長さ別の参考比較はモデルラベルによる自己整合性確認で、人間の正解データによる校正ではない。
+
+出力 `speaker_attribution.json` は発話ID・元時刻・旧ラベル・新ラベル・自動判定・人間確認・根拠・入力ハッシュを保持する。互換形式の発話・翻訳・単語JSONを別出力へ保存する。異なる話者を結合せず、mixed/UNKNOWNはnullの話者として残す。元の話者ごとの重複区間も独立に保存し、推定上の重なりと音響上の混在仮説を区別する。音声分離や混在部分の話者別文字起こしは未実装。
+
+Speaker ReviewはPhase 4/5両方の出力に対応する。人間確認JSONはマニフェスト・音声ハッシュ・レビューキーを照合して取り込み、自動判定とは別に保存する。`human_evaluation.jsonl` に将来の評価用ラベルを保存し、ラベルのない項目の正解率を計算しない。`speaker_timeline.json` は既存Mixerの話者照合に、`tts_regeneration.json` は古いWAVの再生成要否確認に利用する。詳細は [SPEAKER_ATTRIBUTION.md](SPEAKER_ATTRIBUTION.md)。

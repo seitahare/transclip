@@ -196,6 +196,17 @@ python -m unittest discover -s tests -v
 
 [docs/SPEAKER_PROFILES.md](docs/SPEAKER_PROFILES.md) に入力、特徴の測定／推定の区別、確認結果の保存、TTS/Mixerへの接続と制約を記載しています。実際の精度向上は人手の正解確認後に評価します。
 
+## 音響による話者再判定（Phase 5）
+
+`speaker_attribution.py` がPhase 4の参考音声・埋め込みを再利用し、対象音声、前後の音響窓、短時間の発話人数、長さ別の参考比較から話者を再評価します。元のUNKNOWNを条件付きで再判定し、混在・境界・ASR時刻ずれの可能性と根拠を保存します。Speaker Reviewで自動判定と人の判断を分けて確認できます。
+
+```bash
+.venv-diarize/bin/python speaker_attribution.py VIDEO_ID \
+  --analysis-dir output/VIDEO_ID/speaker_analysis/CONTENT_KEY
+```
+
+元JSON・WAVは変更しません。人の確認ラベルを優先し、ラベルがない区間の正解率は算出しません。実装・未校正スコア・互換出力・下流への接続は [docs/SPEAKER_ATTRIBUTION.md](docs/SPEAKER_ATTRIBUTION.md) を参照してください。
+
 ## 次の開発課題
 
 - 言語エンジンの数詞・助数詞・意味保持検査を拡充する。
