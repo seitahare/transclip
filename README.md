@@ -225,3 +225,7 @@ python -m unittest discover -s tests -v
 - APIキーとHugging Faceトークンは環境変数で管理し、ソースコード、ログ、Gitに含めないでください。
 - 現行の `.gitignore` は `input/`、`output/`、`.venv/` 等を除外します。追加の仮想環境 `.venv-diarize/` も **Git管理前に除外対象へ追加**してください。
 - OpenAI APIを使う機能は有料で、モデルダウンロードもネットワーク・ディスク容量を消費します。
+
+## Phase 6: Speech Separation
+
+選択済みクリップの重複候補だけを分離し、話者候補・単語時刻・元音声との比較を別ファイルへ保存します。既存の話者プロフィールとローカルASRを再利用します。操作方法・制約は [docs/SPEECH_SEPARATION.md](docs/SPEECH_SEPARATION.md) を参照してください。

@@ -185,6 +185,12 @@ def apply_review(analysis_dir,decisions_path,input_dir,output_dir):
     return target
 
 
+def build_separation_review(folder, bundle):
+    """Phase 6 review supports arbitrary stem counts in a separate decision schema."""
+    from separation_review import write_review
+    return write_review(folder, bundle)
+
+
 def main(argv=None):
     parser=argparse.ArgumentParser(description='Apply explicit listening decisions without modifying original inputs.')
     parser.add_argument('--analysis-dir',type=Path,required=True);parser.add_argument('--decisions',type=Path,required=True)

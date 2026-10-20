@@ -264,3 +264,7 @@ python -m unittest discover -s tests -v
 出力 `speaker_attribution.json` は発話ID・元時刻・旧ラベル・新ラベル・自動判定・人間確認・根拠・入力ハッシュを保持する。互換形式の発話・翻訳・単語JSONを別出力へ保存する。異なる話者を結合せず、mixed/UNKNOWNはnullの話者として残す。元の話者ごとの重複区間も独立に保存し、推定上の重なりと音響上の混在仮説を区別する。音声分離や混在部分の話者別文字起こしは未実装。
 
 Speaker ReviewはPhase 4/5両方の出力に対応する。人間確認JSONはマニフェスト・音声ハッシュ・レビューキーを照合して取り込み、自動判定とは別に保存する。`human_evaluation.jsonl` に将来の評価用ラベルを保存し、ラベルのない項目の正解率を計算しない。`speaker_timeline.json` は既存Mixerの話者照合に、`tts_regeneration.json` は古いWAVの再生成要否確認に利用する。詳細は [SPEAKER_ATTRIBUTION.md](SPEAKER_ATTRIBUTION.md)。
+
+## Phase 6: separation and speaker-aligned transcription
+
+`speech_separation.py` consumes selected PCM16 audio, non-exclusive diarization, original utterances/words and optional Phase 4 profiles / Phase 5 frame votes. `separation_backends.py` separates supported overlap candidates; `speaker_transcription.py` provides local ASR and timeline provenance. `speaker_review.build_separation_review` delegates arbitrary-stem listening review to `separation_review.py`. Human-reviewed export produces new v3 utterances and an Audio Mixer speaker-analysis envelope; translation/script/TTS regeneration remains explicit. No original intermediate files are overwritten. See [SPEECH_SEPARATION.md](SPEECH_SEPARATION.md).
