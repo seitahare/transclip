@@ -106,7 +106,7 @@ TTSの本実行はQwen3-TTS-MLX専用のPython実行環境から行います（�
 /path/to/Qwen3-TTS-MLX/.venv/bin/python tts_generator.py VIDEO_ID --seconds 30 --max-jobs 3
 ```
 
-TTSの試作では既定のプリセット声を使います。**元の話者の声質を再現するVoice Cloneは、今後の設計・検証対象であり、現行の完成済み機能ではありません**。
+TTSの試作では既定のプリセット声を使います。**許可済み参考音声によるVoice Cloneの登録・生成アダプタはPhase 7で追加しました。実モデルによる声質・発音の検証は、権限確認済み音声の準備後に行います**。
 
 ## ディレクトリとデータ
 
@@ -229,3 +229,7 @@ python -m unittest discover -s tests -v
 ## Phase 6: Speech Separation
 
 選択済みクリップの重複候補だけを分離し、話者候補・単語時刻・元音声との比較を別ファイルへ保存します。既存の話者プロフィールとローカルASRを再利用します。操作方法・制約は [docs/SPEECH_SEPARATION.md](docs/SPEECH_SEPARATION.md) を参照してください。
+
+## 許可済み参考音声によるVoice Clone（Phase 7）
+
+`voice_cloning.py` で参考WAV・正確な文字起こし・利用許可・品質確認を登録し、Baseモデルと既存Presetを切り替えられます。Feedback/Mixerへの接続、キャッシュ、途中再開、比較表・試聴HTMLを用意しました。実音声生成は権限確認済み素材の準備待ちで、今回はモックテストとローカルモデル事前確認までです。[登録形式・実行手順](docs/VOICE_CLONING.md) を参照してください。

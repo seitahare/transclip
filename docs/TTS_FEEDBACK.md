@@ -123,3 +123,8 @@ macOSで再生するには、feedback.jsonの `audio_file` を使う:
 ```bash
 afplay '/absolute/path/to/speech.wav'
 ```
+
+
+## Phase 7の追加
+
+許可済み参考音声によるQwen Baseアダプタ、登録CLI、Clone用キャッシュとMixer検証を追加した。本文のPhase 4時点の未実装記述については、[VOICE_CLONING.md](VOICE_CLONING.md)を参照。実際のクローン生成・発音・声質の検証は権限確認済み音声の準備後に行う。

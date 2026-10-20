@@ -57,8 +57,8 @@ clipper.py ──► output/<video_id>/clip_<start>_<end>.mp4
                   └─► tts_generator.py --script / tts_feedback.py
                          └─► 話者別WAV / feedback.json / 校正用標本
                                 └─► audio_mixer.py ──► 話者別トラック / mix_report.json / 診断用MP4
-[計画中]
-  approved_voice_profile/* ──────► speaker-aware TTS (権利確認後)
+[Phase 7実装済み・実音声検証は権限確認後]
+  voice_cloning.py / voice_profiles.json ──► Qwen Base / TTS Feedback / Audio Mixer
 ```
 
 ※矢印は概念上の依存関係です。全ステージが単一CLIで連続実行されるわけではありません。入力動画の拡張子は現実には `mp4` 以外の場合もあり、`clipper.py` の現行実装は `source.mp4` を前提とします。
@@ -268,3 +268,7 @@ Speaker ReviewはPhase 4/5両方の出力に対応する。人間確認JSONは�
 ## Phase 6: separation and speaker-aligned transcription
 
 `speech_separation.py` consumes selected PCM16 audio, non-exclusive diarization, original utterances/words and optional Phase 4 profiles / Phase 5 frame votes. `separation_backends.py` separates supported overlap candidates; `speaker_transcription.py` provides local ASR and timeline provenance. `speaker_review.build_separation_review` delegates arbitrary-stem listening review to `separation_review.py`. Human-reviewed export produces new v3 utterances and an Audio Mixer speaker-analysis envelope; translation/script/TTS regeneration remains explicit. No original intermediate files are overwritten. See [SPEECH_SEPARATION.md](SPEECH_SEPARATION.md).
+
+## Phase 7: approved-reference synthesis
+
+`voice_cloning.py` registers hash-bound audio/transcript/consent/quality evidence and provides the local Qwen Base adapter and CLI. `language.voice.VoiceProfile` carries exact reference text and review provenance. `tts_feedback.audio_request` preserves v1 preset requests and adds v2 clone requests with speaker/profile snapshots. Audio Mixer verifies both formats and rejects clone same-speaker collisions even in diagnostic mode. `compare` creates portable reference/preset/clone listening artifacts. Real cloning is deferred by user instruction until authorized references are available; mock checks do not establish real synthesis quality. See [VOICE_CLONING.md](VOICE_CLONING.md).

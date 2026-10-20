@@ -354,7 +354,7 @@ class QwenPresetSynthesizer:
     """
     supported_voice_modes = {"preset"}
 
-    def __init__(self, model_id=DEFAULT_MODEL, *, seed=0):
+    def __init__(self, model_id=DEFAULT_MODEL, *, seed=0, expected_model_type="custom_voice"):
         import os
         from importlib.metadata import version
         os.environ["HF_HUB_OFFLINE"] = "1"
@@ -371,8 +371,8 @@ class QwenPresetSynthesizer:
         if not all(p.is_file() for p in required) or not list(self.snapshot.glob("*.safetensors")) or not list((self.snapshot / "speech_tokenizer").glob("*.safetensors")):
             raise ValueError("Incomplete cached model. Download requires separate approval.")
         config = json.loads(required[0].read_text())
-        if config.get("tts_model_type") != "custom_voice":
-            raise ValueError("Phase 2 supports preset CustomVoice models only.")
+        if config.get("tts_model_type") != expected_model_type:
+            raise ValueError(f"Expected {expected_model_type} model, got {config.get('tts_model_type')!r}.")
         files = []
         for p in sorted(self.snapshot.rglob("*")):
             if p.is_file():

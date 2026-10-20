@@ -15,9 +15,14 @@ class VoiceProfile:
     consent_reference: str | None = None
     design_description: str | None = None
     analysis: dict | None = None
+    reference_text: str | None = None
+    reference_audio_sha256: str | None = None
+    reference_text_review: dict | None = None
+    source_audio_quality: dict | None = None
+    voice_characteristics: dict | None = None
 
     def __post_init__(self):
-        if not self.speaker or self.speaker in ('UNKNOWN','REVIEW'):
+        if not self.speaker or self.speaker in ('UNKNOWN','REVIEW','MIXED'):
             raise ValueError('A known speaker ID is required.')
         if self.mode not in {'preset','voice_design','approved_clone','approved_reference'}:
             raise ValueError('Unsupported voice mode.')
@@ -90,7 +95,7 @@ class ProfiledPresetSynthesizer:
         if document.get('kind')!='speaker_profiles' or document.get('format_version')!=1:
             raise ValueError('Expected speaker_profiles v1.')
         ids=[p.get('speaker_id') for p in document.get('profiles',[])]
-        if not ids or len(ids)!=len(set(ids)) or any(not isinstance(s,str) or s in ('UNKNOWN','REVIEW') for s in ids):
+        if not ids or len(ids)!=len(set(ids)) or any(not isinstance(s,str) or s in ('UNKNOWN','REVIEW','MIXED') for s in ids):
             raise ValueError('Invalid profile speaker IDs.')
         self.backend,self.document=backend,document
         self.identity={**backend.identity,'speaker_profiles_fingerprint':fingerprint(document),

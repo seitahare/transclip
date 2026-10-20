@@ -20,7 +20,7 @@ import wave
 
 from language.cache import atomic_json, fingerprint
 from language.timing import measure_wav
-from tts_feedback import UNKNOWN, detect_collisions, number, validate_script
+from tts_feedback import UNKNOWN, detect_collisions, number, validate_script, audio_request
 
 BASE_DIR = Path(__file__).resolve().parent
 RATE = 48000
@@ -132,7 +132,7 @@ def validate_feedback(feedback_path, selection_path, video_id):
         if (not isinstance(tts, dict) or not tts.get("model") or not tts.get("backend")
                 or not isinstance(tts.get("settings"), dict) or tts != report.get("tts")):
             raise ValueError(f"{uid}: inconsistent TTS identity/settings.")
-        request = {"format_version": 1, "tts": tts, "voice": row["voice"], "text_ja": row["text_ja"], "mode": "preset"}
+        request = audio_request(row, tts)
         key = fingerprint(request)
         if row.get("audio_cache_key") != key:
             raise ValueError(f"{uid}: audio cache identity mismatch.")
@@ -262,6 +262,8 @@ def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *
     review_ids = [r["id"] for r in active if r["review_required"]]
     if not complete:
         blockers.append("no_generated_audio")
+    if same and any(r.get("voice_mode")=="approved_clone" for r in active):
+        blockers.append("clone_same_speaker_collision_requires_resolution")
     if not diagnostic:
         if same: blockers.append("unresolved_same_speaker_collisions")
         if missing or excluded: blockers.append("undubbed_source_intervals")
@@ -360,6 +362,9 @@ def render_plan(plan, output_dir):
     if plan["blockers"]:
         raise ValueError("Render blocked: " + ", ".join(plan["blockers"]))
     plan = copy.deepcopy(plan)
+    for row in plan["placements"]:
+        if row.get("voice_profile"):
+            audio_request(row, row["tts"])  # Recheck current reference/authorization before rendering or reuse.
     source = Path(plan["inputs"]["source_video"])
     plan["inputs"]["source_video_sha256"] = sha256_file(source)
     plan["ffmpeg_version"] = run_command(["ffmpeg", "-version"]).decode().splitlines()[0]

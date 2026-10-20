@@ -11,10 +11,10 @@ import tempfile
 
 from language.cache import atomic_json, fingerprint
 from language.timing import measure_wav, feedback_profiles
-from language.voice import VoiceProfile
+from language.voice import VoiceProfile, synthesize_profile
 
 FORMAT_VERSION = 1
-UNKNOWN = (None, "UNKNOWN", "REVIEW")
+UNKNOWN = (None, "UNKNOWN", "REVIEW", "MIXED")
 
 
 def number(value, label, *, positive=False):
@@ -130,10 +130,23 @@ def plan_script(script, voices, *, seconds=30, entry_ids=None):
     return rows
 
 
+def audio_request(row, identity, *, validate_live=True):
+    """Shared receipt contract for feedback and mixer; preserve legacy preset keys."""
+    snapshot=row.get('voice_profile')
+    if snapshot is None:
+        if row.get('voice_mode','preset')!='preset':raise ValueError('Clone requires Voice Profile provenance.')
+        return {'format_version':1,'tts':identity,'voice':row['voice'],'text_ja':row['text_ja'],'mode':'preset'}
+    from voice_cloning import validate_snapshot
+    validate_snapshot(snapshot,row['speaker'],live=validate_live)
+    if row.get('voice_mode')!='approved_clone' or row.get('voice')!='approved_clone:'+snapshot['profile_fingerprint']:
+        raise ValueError('Voice mode/label and profile mismatch.')
+    return {'format_version':2,'tts':identity,'voice':row['voice'],'speaker_id':row['speaker'],
+            'text_ja':row['text_ja'],'mode':'approved_clone','voice_profile':snapshot}
+
+
 def cached_audio(output_dir, backend, row):
     """Publish audio + receipt as one directory rename; never overwrite a WAV."""
-    request = {"format_version": 1, "tts": backend.identity, "voice": row["voice"],
-               "text_ja": row["text_ja"], "mode": "preset"}
+    request = audio_request(row, backend.identity)
     key = fingerprint(request)
     parent = output_dir / "audio" / row["speaker"]
     target = parent / key
@@ -148,9 +161,12 @@ def cached_audio(output_dir, backend, row):
     parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".pending-", dir=parent))
     try:
-        generated = backend.synthesize(text=row["text_ja"],
-                                       profile=VoiceProfile(row["speaker"], voice=row["voice"]),
-                                       output_path=str(temporary / "speech.wav"))
+        profile=VoiceProfile(row['speaker'],voice=row['voice'])
+        if row.get('voice_profile'):
+            from voice_cloning import validate_snapshot
+            profile=validate_snapshot(row['voice_profile'],row['speaker'])
+        generated = synthesize_profile(backend,text=row['text_ja'],profile=profile,output_path=str(temporary/'speech.wav'))
+        if audio_request(row,backend.identity)!=request:raise ValueError('Profile or permission changed during generation.')
         measured = measure_wav(temporary / "speech.wav")
         atomic_json(temporary / "receipt.json", {"cache_key": key, "request": request,
                     "measurement": measured, "backend_result": generated}, overwrite=False)
@@ -243,17 +259,34 @@ def feedback_markdown(report):
 
 
 def run_feedback(script_path, output_dir, backend, voices, *, seconds=30,
-                 max_jobs=None, entry_ids=None, baseline_manifest=None):
+                 max_jobs=None, entry_ids=None, baseline_manifest=None, voice_profiles=None):
     script_path, output_dir = Path(script_path), Path(output_dir)
     original_bytes = script_path.read_bytes()
     script = json.loads(original_bytes)
     rows = plan_script(script, voices, seconds=seconds, entry_ids=entry_ids)
+    snapshots={}
+    if voice_profiles is not None:
+        from voice_cloning import profile_snapshot
+        if baseline_manifest:raise ValueError('Legacy preset baseline cannot be mislabeled as clone; compare separate reports.')
+        for speaker,profile in voice_profiles.items():
+            if profile.speaker!=speaker:raise ValueError('Profile map speaker mismatch.')
+            snapshots[speaker]=profile_snapshot(profile)
+            if voices.get(speaker)!='approved_clone:'+snapshots[speaker]['profile_fingerprint']:raise ValueError('Profile voice label mismatch.')
+        for row in rows:
+            if row['speaker'] in snapshots:
+                row.update(voice_mode='approved_clone',voice_profile=snapshots[row['speaker']])
+                row['review_required']=True
+                row['review_reasons']=sorted(set(row['review_reasons']+['clone_pronunciation_and_voice_similarity_unverified']))
+            elif row['generation_status']=='pending':raise ValueError('Missing clone profile for planned speaker.')
+    elif getattr(backend,'supported_voice_modes',{'preset'})=={'approved_clone'}:
+        raise ValueError('Clone backend requires explicit voice_profiles.')
     if max_jobs is not None and (type(max_jobs) is not int or max_jobs <= 0):
         raise ValueError("max_jobs must be positive.")
     identity = copy.deepcopy(backend.identity)
     request = {"format_version": 1, "script": script, "tts": identity, "voices": voices,
                "seconds": seconds, "entry_ids": sorted(entry_ids) if entry_ids else None,
                "baseline": fingerprint(json.loads(Path(baseline_manifest).read_text())) if baseline_manifest else None}
+    if snapshots:request['voice_profiles']=snapshots
     run_key = fingerprint(request)
     run_dir = output_dir / "runs" / run_key
     report = {"format_version": FORMAT_VERSION, "kind": "tts_feedback", "run_key": run_key,
