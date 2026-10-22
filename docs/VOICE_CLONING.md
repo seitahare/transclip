@@ -4,7 +4,7 @@
 
 `voice_cloning.py` にローカルのApproved Voice Cloneバックエンド、登録・権限/品質検証、任意数の話者プロフィール、生成CLI、Preset比較HTMLを実装した。既存のCustomVoiceプリセットは維持する。
 
-**ユーザーの追加指示に従い、実モデルによるClone生成は実施していない。** 権限・正確な文字起こし・許可記録が揃った参考音声が用意できてから行う。Phase 4で抽出したインタビュー音声は声質分析用であり、登録済み許可音声と扱わない。今回の検証はモック/合成テスト波形、既存環境/ローカルモデルの事前確認まで。日本語発音、声質の近さ、複数文章での聴感一貫性は未評価。
+**2026-10-22更新: 新しい架空日本語参考音声に対するユーザーの再利用許可・試聴確認後、実モデルで3発話を生成した。** 日本語参考→日本語生成、Preset比較、Feedbackと診断MP4まで確認済み。生成後の日本語の正しさはユーザー確認済み。全文一致・数値の発音、声質の近さ、複数文章での聴感一貫性は別途確認待ち。Phase 4のインタビュー参考および旧 reference_v0.3.wav は未承認のままで使用していない。英語の新規架空参考も生成したが、再利用許可のみ確認済みで、発声内容・品質確認待ちのため英語参考→日本語Cloneは未実施。[統合結果](PHASE7_INTEGRATION.md) を参照。
 
 ## モデルと実行環境
 
@@ -17,7 +17,7 @@
 |量子化|configの `bits: 8`, `group_size: 64`, `mode: affine`|
 |ローカルsnapshot|14ファイル、合計3,104,158,788バイト（実行時メモリ量ではない）|
 |確認したライブラリ|qwen3-tts-mlx 0.2.0 / mlx-audio 0.5.1 / mlx 0.32.2|
-|実モデル推論|未実施|
+|実モデル推論|承認済み架空日本語参考から3発話生成成功。日本語の正しさはユーザー確認済み。全文一致・声質は確認待ち|
 
 [Qwen公式](https://github.com/QwenLM/Qwen3-TTS)のBaseの参照音声・文字起こしによる条件付けと、[MLX版モデルカード](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit)、[使用中のMLXラッパー](https://github.com/howon-kim/Qwen3-TTS-MLX)を確認した。[0.6B Base 8bit](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit)も代替候補だがローカルに未導入で、性能/メモリの実測比較は行っていない。1.7Bがメモリ不足になる場合に、別途承認を得て検討する。途中ダウンロードのBase bf16は使用しない。
 
@@ -149,7 +149,7 @@ Presetベースライン用 `voices.json` は `{"SPEAKER_A":"Ryan"}` のよう�
   --entry-id dub-001 --entry-id dub-002 --entry-id dub-003 --max-jobs 3 --seconds 30
 ```
 
-従来の `tts_generator.py --script` も利用可能。Voice Design生成は今回の対象外。
+従来の `tts_generator.py --script` も利用可能。架空Voice Design参考の生成は `design-reference` を追加した。生成だけでCloneを許可しない。
 
 ## Feedback・Mixer・比較
 
@@ -166,7 +166,7 @@ Mixerはv1 Preset / v2 Cloneのreceiptを照合し、話者とプロフィール
   --output output/VIDEO_ID/voice_comparison
 ```
 
-同じ発話ID/話者/テキスト/時刻を照合し、`comparison.json`, `comparison.md`, `review.html` と参照・Preset・CloneのWAVコピーを別フォルダーに出す。HTMLの再生ボタン、またはMacの `afplay '/absolute/path/speech.wav'` で聞き比べる。生成時間差・音量・破損検査・同一プロフィール使用を記録するが、発音/声質の成功や聴感一貫性を自動で宣言しない。今回Speaker Embeddingによる英日比較は未実施で、スコアは出していない。
+同じ発話ID/話者/テキスト/時刻を照合し、`comparison.json`, `comparison.md`, `review.html` と参照・Preset・CloneのWAVコピーを別フォルダーに出す。HTMLの再生ボタン、またはMacの `afplay '/absolute/path/speech.wav'` で聞き比べる。生成時間差・音量・破損検査・同一プロフィール使用を記録するが、発音/声質の成功や聴感一貫性を自動で宣言しない。日本語参考→日本語生成のEmbedding比較は `quality` に追加した。英語参考→日本語生成の比較は未実施。
 
 ## テスト・残る検証
 
@@ -174,6 +174,6 @@ Mixerはv1 Preset / v2 Cloneのreceiptを照合し、話者とプロフィール
 .venv-language/bin/python -m unittest discover -s tests -v
 ```
 
-開始時193件成功。追加後は合計232件成功（既存193件＋新規39件）。新規39件は、参照WAV/品質、text/audioの一致確認、許可/ハッシュ、任意数話者、UNKNOWN、ネイティブ生成呼び出し/失敗、条件付け再利用/分離、キャッシュ/再開/変更、Feedback、Mixer、比較、非破壊をモック・短いテスト波形で検証する。**テストの許可記録は架空のfixtureで、実在人物の許可記録ではない。**
+初期Phase 7は開始時193件、追加後232件成功（新規39件）。旧TRANS統合時はこの232件を再実行し、追加23件を含め合計255件成功。新規39件は、参照WAV/品質、text/audioの一致確認、許可/ハッシュ、任意数話者、UNKNOWN、ネイティブ生成呼び出し/失敗、条件付け再利用/分離、キャッシュ/再開/変更、Feedback、Mixer、比較、非破壊をモック・短いテスト波形で検証する。**テストの許可記録は架空のfixtureで、実在人物の許可記録ではない。**
 
-今後は権限確認済みの1話者から2～3発話を生成し、発音・欠落・声質・文章間の一貫性・処理時間/メモリを実測/聴取する。コードの生成分岐はモック検証済みだが、実モデルの日本語WAV生成成功はまだ確認していない。モック成功と実音声成功を区別する。原音声・既存JSON・仮想環境は変更せず、commit/pushは行わない。
+新しい架空の1話者から3発話の日本語WAVを実生成し、時間・波形品質・条件付け再利用を確認した。次に発音・欠落・声質・文章間の一貫性を聴取評価し、英語参考の承認後に言語をまたぐ生成を検証する。モック成功・実生成成功・聴感品質の合格は区別する。原音声・既存JSON・仮想環境は変更せず、commit/pushは行わない。

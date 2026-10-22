@@ -232,4 +232,10 @@ python -m unittest discover -s tests -v
 
 ## 許可済み参考音声によるVoice Clone（Phase 7）
 
-`voice_cloning.py` で参考WAV・正確な文字起こし・利用許可・品質確認を登録し、Baseモデルと既存Presetを切り替えられます。Feedback/Mixerへの接続、キャッシュ、途中再開、比較表・試聴HTMLを用意しました。実音声生成は権限確認済み素材の準備待ちで、今回はモックテストとローカルモデル事前確認までです。[登録形式・実行手順](docs/VOICE_CLONING.md) を参照してください。
+`voice_cloning.py` で参考WAV・正確な文字起こし・利用許可・品質確認を登録し、Baseモデルと既存Presetを切り替えられます。Feedback/Mixerへの接続、キャッシュ、途中再開、比較表・試聴HTMLを用意しました。新規の架空参考音声に対する人手の再利用許可・試聴確認後、Baseによる日本語3発話の実生成と診断MP4まで検証済みです。生成後の日本語の正しさもユーザー確認済みで、全文一致・声質は別途確認対象です。[登録形式・実行手順](docs/VOICE_CLONING.md) を参照してください。
+
+### 旧TRANS統合と実モデル検証
+
+`design-reference` で架空参考音声の生成履歴・未承認レビューを作成し、確認後に `register --generation-record` で登録できます。`quality` は参考/Preset/Cloneの試聴HTML・F0・任意の既存Embedding比較を保存します。Mixerの `--max-timing-shift` は同一話者の隣接発話を小幅に遅延する明示オプション（既定0、上限2秒）です。波形を切断・倍速化しません。
+
+[機能比較](docs/TRANS_COMPARISON.md)、[登録・比較・配置手順と実測結果](docs/PHASE7_INTEGRATION.md) を参照してください。現時点の自動テストは255件成功。英語参考→日本語生成、開発動画の大きな時間衝突、知覚上の声質評価は残る課題です。

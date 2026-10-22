@@ -206,7 +206,9 @@ def attach_speaker_evidence(plan, analysis_path):
 
 
 def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *, seconds=30,
-               mode="japanese-only", diagnostic=False, extend_to_fit=False, reference_gain=.12):
+               mode="japanese-only", diagnostic=False, extend_to_fit=False, reference_gain=.12, max_timing_shift=0):
+    number(max_timing_shift, "maximum timing shift")
+    if max_timing_shift > 2:raise ValueError("Maximum timing shift is limited to 2 seconds.")
     number(seconds, "seconds", positive=True)
     number(reference_gain, "reference gain")
     if reference_gain > .5 or mode not in ("japanese-only", "reference-mix"):
@@ -236,9 +238,16 @@ def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *
     active = [r for r in rows if r["relative_start"] < seconds]
     complete = [r for r in active if r["generation_status"] == "complete"]
     missing = [r for r in active if r["generation_status"] != "complete"]
+    timing_adjustment = None
+    if max_timing_shift:
+        from timing_adjustment import bounded_placements
+        obstacles = [dict(r, id="excluded:"+str(i), speaker=None, generation_status="skipped")
+                     for i,r in enumerate(feedback.get("source_excluded",[]))
+                     if "relative_start" in r and "relative_end" in r]
+        timing_adjustment = bounded_placements([*active,*obstacles],seconds=seconds,max_shift=max_timing_shift)
     # Round only to the nearest output sample; preserve full resampled lengths.
     for row in complete:
-        row["placement_sample"] = round(row["relative_start"] * RATE)
+        row["placement_sample"] = round((timing_adjustment["starts"][row["id"]] if timing_adjustment else row["relative_start"]) * RATE)
         row["placement_seconds"] = row["placement_sample"] / RATE
         row["end_sample"] = row["placement_sample"] + math.ceil(row["actual_tts_duration_seconds"] * RATE - 1e-7)
         row["absolute_placement_seconds"] = selection["start"] + row["placement_seconds"]
@@ -255,13 +264,19 @@ def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *
     duration = frames / RATE
     if duration > selection["end"] - selection["start"] + 1e-9:
         blockers.append("audio_exceeds_selected_source_range")
-    detect_collisions(active)
+    detect_collisions(active,use_placements=bool(timing_adjustment))
     same = overlap_pairs(active, "actual_same_speaker_conflicts")
     other = overlap_pairs(active, "actual_other_speaker_overlaps")
     excluded = [r for r in feedback.get("source_excluded", []) if r.get("relative_start", math.inf) < duration]
     review_ids = [r["id"] for r in active if r["review_required"]]
     if not complete:
         blockers.append("no_generated_audio")
+    if timing_adjustment and same:
+        blockers.append("bounded_timing_unresolved_same_speaker_collision")
+    if timing_adjustment and any(p["source_overlap_seconds"] <= 0 for p in other):
+        blockers.append("bounded_timing_introduced_other_speaker_overlap")
+    if timing_adjustment and any(e["status"]=="placed" for e in timing_adjustment["events"]) and not diagnostic:
+        blockers.append("timing_adjustment_listening_review_required")
     if same and any(r.get("voice_mode")=="approved_clone" for r in active):
         blockers.append("clone_same_speaker_collision_requires_resolution")
     if not diagnostic:
@@ -277,6 +292,7 @@ def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *
             "duration_seconds": duration, "absolute_video_start": selection["start"],
             "absolute_video_end": selection["start"] + duration,
             "mode": mode, "diagnostic": diagnostic, "quality_label": quality,
+            **({"timing_adjustment":timing_adjustment} if timing_adjustment else {}),
             "reference_gain": reference_gain if mode == "reference-mix" else 0,
             "source_audio_policy": "quiet English reference; no speech separation" if mode == "reference-mix" else "muted",
             "sample_rate": RATE, "channels": CHANNELS, "sample_frames": frames,
@@ -460,6 +476,7 @@ def main(argv=None):
     parser.add_argument("--reference-gain", type=float, default=.12)
     parser.add_argument("--diagnostic", action="store_true", help="Explicitly allow reported collisions and undubbed/review entries")
     parser.add_argument("--extend-to-fit", action="store_true", help="Extend only within selection to keep complete speech")
+    parser.add_argument("--max-timing-shift",type=float,default=0,help="Opt-in adjacent same-speaker delay, 0..2 seconds; no time stretching")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print plan; generate no media")
     args = parser.parse_args(argv)
     try:
@@ -468,7 +485,7 @@ def main(argv=None):
         plan = build_plan(args.feedback, args.selection or inputs / "selection.json",
                           args.source_video or inputs / "source.mp4", args.source_info or inputs / "source.info.json",
                           args.video_id, seconds=args.seconds, mode=args.mode, diagnostic=args.diagnostic,
-                          extend_to_fit=args.extend_to_fit, reference_gain=args.reference_gain)
+                          extend_to_fit=args.extend_to_fit, reference_gain=args.reference_gain,max_timing_shift=args.max_timing_shift)
         if args.speaker_analysis:
             attach_speaker_evidence(plan, args.speaker_analysis)
         print(json.dumps({k: plan[k] for k in ("video_id", "quality_label", "duration_seconds", "same_speaker_conflicts",

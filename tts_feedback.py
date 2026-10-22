@@ -177,7 +177,7 @@ def cached_audio(output_dir, backend, row):
     return target / "speech.wav", measured, generated, key, False
 
 
-def detect_collisions(rows):
+def detect_collisions(rows, *, use_placements=False):
     """Use unmodified starts and full measured durations on independent tracks."""
     active = [e for e in rows if e["generation_status"] == "complete"]
     for e in rows:
@@ -186,7 +186,9 @@ def detect_collisions(rows):
         e["review_reasons"] = [r for r in e["review_reasons"] if r != "actual_same_speaker_collision"]
     for i, a in enumerate(active):
         for b in active[i+1:]:
-            overlap = min(a["actual_playback_end"], b["actual_playback_end"]) - max(a["relative_start"], b["relative_start"])
+            left = a.get("placement_seconds",a["relative_start"]) if use_placements else a["relative_start"]
+            right = b.get("placement_seconds",b["relative_start"]) if use_placements else b["relative_start"]
+            overlap = min(left+a["actual_tts_duration_seconds"], right+b["actual_tts_duration_seconds"]) - max(left,right)
             if overlap <= 1e-9:
                 continue
             same = a["speaker"] == b["speaker"] and a["speaker"] not in UNKNOWN

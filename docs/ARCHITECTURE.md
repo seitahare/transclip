@@ -254,7 +254,7 @@ python -m unittest discover -s tests -v
 
 `speaker_profiles.json` は波形測定、DSP推定、ASR推定、モデル埋め込みを分離し、品質評価付き参考候補を持ちます。`speaker_review.py` のHTMLで音声を聞き比べ、人間の判断と文字起こし修正を別JSONへ保存・検証取込できます。
 
-`language/voice.py` でPreset / Voice Design / Approved Cloneの契約を区別。現行QwenはPresetのみで、解析を添付できるものの声質再現は行いません。`audio_mixer.py --speaker-analysis` は話者変更に対して既存WAVの付け替えを禁止し、元の区間にない別話者の重なりも分類します。詳細は [SPEAKER_PROFILES.md](SPEAKER_PROFILES.md)。実モデルの精度向上は人手正解ラベルなしには主張しません。
+`language/voice.py` でPreset / Voice Design / Approved Cloneの契約を区別。Phase 4時点はPresetのみ。Phase 7で承認済み参考を用いるBaseと架空Voice Design参考生成を追加しました。`audio_mixer.py --speaker-analysis` は話者変更に対して既存WAVの付け替えを禁止し、元の区間にない別話者の重なりも分類します。詳細は [SPEAKER_PROFILES.md](SPEAKER_PROFILES.md)。実モデルの精度向上は人手正解ラベルなしには主張しません。
 
 
 ## Phase 5: Speaker Attribution Refinement
@@ -271,4 +271,10 @@ Speaker ReviewはPhase 4/5両方の出力に対応する。人間確認JSONは�
 
 ## Phase 7: approved-reference synthesis
 
-`voice_cloning.py` registers hash-bound audio/transcript/consent/quality evidence and provides the local Qwen Base adapter and CLI. `language.voice.VoiceProfile` carries exact reference text and review provenance. `tts_feedback.audio_request` preserves v1 preset requests and adds v2 clone requests with speaker/profile snapshots. Audio Mixer verifies both formats and rejects clone same-speaker collisions even in diagnostic mode. `compare` creates portable reference/preset/clone listening artifacts. Real cloning is deferred by user instruction until authorized references are available; mock checks do not establish real synthesis quality. See [VOICE_CLONING.md](VOICE_CLONING.md).
+`voice_cloning.py` registers hash-bound audio/transcript/consent/quality evidence and provides the local Qwen Base adapter and CLI. `language.voice.VoiceProfile` carries exact reference text and review provenance. `tts_feedback.audio_request` preserves v1 preset requests and adds v2 clone requests with speaker/profile snapshots. Audio Mixer verifies both formats and rejects clone same-speaker collisions even in diagnostic mode. `compare` creates portable reference/preset/clone listening artifacts. Real Japanese synthesis was validated on three utterances after the user authorized and reviewed a newly designed fictional Japanese reference. The user confirmed the generated Japanese sounds correct; exact transcript/number matching and perceptual similarity/consistency remain separate review items. English-reference reuse is authorized, but its transcript/quality review is pending; mock checks and embedding scores do not establish perceptual quality. See [VOICE_CLONING.md](VOICE_CLONING.md).
+
+### TRANS integration additions
+
+`synthetic_reference.py` implements offline fictional VoiceDesign reference generation with model revision, exact instruction/text, seed/settings, WAV measurements/hashes and unapproved review templates. `register --generation-record` binds this provenance to separately approved reference records. Generation metadata is immutable; later authorization is a separate record.
+
+`voice_quality.py` uses existing DSP and optional offline pyannote embeddings for reference/within-speaker comparison and portable listening HTML. No score threshold grants approval. `timing_adjustment.py` optionally proposes bounded delays inside adjacent same-speaker groups using actual WAV duration. Source overlap, other speakers and undubbed intervals are barriers. Mixer preserves source times alongside placement times, rechecks collisions and refuses unresolved conflicts when this option is active. No waveform edit, truncation or speed change is applied. Default JSON behavior is preserved when the option is disabled. See [PHASE7_INTEGRATION.md](PHASE7_INTEGRATION.md).

@@ -288,7 +288,14 @@ def main(argv=None):
         if name=='register':
             c.add_argument('--consent',type=Path,required=True);c.add_argument('--review',type=Path,required=True)
             c.add_argument('--phase4-profiles',type=Path);c.add_argument('--reference-id')
+            c.add_argument('--generation-record',type=Path,help='Bind an independently generated synthetic reference; never grants permission')
+    c=sub.add_parser('design-reference');c.add_argument('--speaker',required=True)
+    c.add_argument('--text-file',type=Path,required=True);c.add_argument('--instruction-file',type=Path,required=True)
+    c.add_argument('--language',choices=('Japanese','English'),default='Japanese');c.add_argument('--seed',type=int,default=0)
+    c.add_argument('--model');c.add_argument('--output',type=Path,required=True);c.add_argument('--fictional',action='store_true',required=True)
     c=sub.add_parser('candidates');c.add_argument('--phase4-profiles',type=Path,required=True);c.add_argument('--speaker',required=True)
+    c=sub.add_parser('quality');c.add_argument('--manifest',type=Path,required=True);c.add_argument('--output',type=Path,required=True)
+    c.add_argument('--embeddings',action='store_true',help='Use existing offline pyannote environment/model; scores do not approve voices')
     c=sub.add_parser('compare');c.add_argument('--preset-feedback',type=Path,required=True);c.add_argument('--clone-feedback',type=Path,required=True);c.add_argument('--output',type=Path,required=True)
     c=sub.add_parser('generate');c.add_argument('video_id');c.add_argument('--script',type=Path,required=True)
     c.add_argument('--mode',choices=('preset','approved_clone'),required=True);c.add_argument('--profiles',type=Path,action='append')
@@ -296,6 +303,18 @@ def main(argv=None):
     c.add_argument('--seconds',type=float,default=30);c.add_argument('--max-jobs',type=int);c.add_argument('--entry-id',action='append')
     c.add_argument('--seed',type=int,default=0);c.add_argument('--dry-run',action='store_true')
     a=p.parse_args(argv)
+    if a.command=='design-reference':
+        from synthetic_reference import QwenDesignSynthesizer,DEFAULT_DESIGN,generate_reference
+        backend=QwenDesignSynthesizer(a.model or DEFAULT_DESIGN,seed=a.seed,language=a.language)
+        print(generate_reference(backend,speaker=a.speaker,text=a.text_file.read_text(encoding='utf-8'),
+              instruction=a.instruction_file.read_text(encoding='utf-8'),output=a.output,fictional=a.fictional));return
+    if a.command=='quality':
+        from voice_quality import compare_voices
+        embedder=None
+        if a.embeddings:
+            from speaker_refinement import OfflinePyannote
+            embedder=OfflinePyannote()
+        print(compare_voices(a.manifest,a.output,embedder=embedder));return
     if a.command=='compare':print(compare_feedback(a.preset_feedback,a.clone_feedback,a.output));return
     if a.command=='template':print(prepare_review_template(a.reference_audio,a.reference_text,a.speaker,a.output));return
     if a.command=='register':
@@ -312,6 +331,11 @@ def main(argv=None):
                 'summary_dsp_estimates':source.get('summary_dsp_estimates'),'model_estimates':source.get('model_estimates'),
                 'selected_reference':refs[0]}
         elif a.reference_id:p.error('--reference-id requires --phase4-profiles.')
+        if a.generation_record:
+            from synthetic_reference import validate_generation_record
+            record=validate_generation_record(a.generation_record,audio=a.reference_audio,
+                    text=a.reference_text.read_text(encoding='utf-8'),speaker=a.speaker)
+            characteristics={**(characteristics or {}),'synthetic_generation':record}
         print(register_profile(speaker=a.speaker,audio=a.reference_audio,text_path=a.reference_text,consent_path=a.consent,review_path=a.review,output=a.output,characteristics=characteristics));return
     if a.command=='candidates':print(json.dumps(phase4_candidates(json.loads(a.phase4_profiles.read_text()),a.speaker,a.phase4_profiles.parent),ensure_ascii=False,indent=2));return
     from tts_feedback import plan_script,run_feedback
