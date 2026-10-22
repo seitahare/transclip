@@ -7,15 +7,18 @@ import unittest
 from unittest.mock import patch
 
 from language.cache import atomic_json
-from timing_adjustment import bounded_placements
+from timing_adjustment import bounded_placements, diagnose_collision_budgets
 from tts_feedback import run_feedback
 from test_audio_mixer import fixture_script, Backend
 import audio_mixer
 
 
-def row(uid,speaker,start,end,duration,status='complete'):
-    return {'id':uid,'speaker':speaker,'relative_start':start,'relative_end':end,
-            'actual_tts_duration_seconds':duration,'generation_status':status}
+def row(uid,speaker,start,end,duration,status='complete',mora=None,pause=0.0):
+    r={'id':uid,'speaker':speaker,'relative_start':start,'relative_end':end,
+       'actual_tts_duration_seconds':duration,'generation_status':status,'pause_seconds':pause}
+    if mora is not None:
+        r['mora_count']=mora
+    return r
 
 
 class TimingAdjustmentTests(unittest.TestCase):
@@ -65,3 +68,34 @@ class TimingAdjustmentTests(unittest.TestCase):
             self.assertEqual(plan['placements'][1]['end_sample']-plan['placements'][1]['placement_sample'],38400)
             self.assertIn('bounded_timing_unresolved_same_speaker_collision',blocked['blockers'])
             self.assertEqual(feedback.read_bytes(),before)
+    def test_diagnose_collision_budgets_computes_exact_reduction_and_mora_target(self):
+        # Simulate the real 11.26s English -> 16.56s Japanese TTS overrun colliding with next same-speaker turn at 13.50s
+        rows=[
+            row('dub-002','SPEAKER_00',1.90,13.16,16.56,mora=105,pause=0.75),
+            row('dub-004','SPEAKER_01',5.00,6.20,1.10,mora=8,pause=0.0),  # Natural cross-speaker overlap!
+            row('dub-006','SPEAKER_00',13.50,16.00,2.40,mora=16,pause=0.25),
+        ]
+        before=copy.deepcopy(rows)
+        diag=diagnose_collision_budgets(rows,seconds=30.0,max_shift=0.5,minimum_pause=0.04)
+        self.assertEqual(rows,before)
+        self.assertFalse(diag['waveform_modified'])
+        self.assertTrue(diag['requires_regeneration'])
+        self.assertEqual(len(diag['unresolved_same_speaker_collisions']),1)
+        collision=diag['unresolved_same_speaker_collisions'][0]
+        self.assertEqual(collision['speaker'],'SPEAKER_00')
+        self.assertEqual(collision['entry_ids'],['dub-002','dub-006'])
+        b_map={b['id']:b for b in diag['entry_budgets']}
+        b2=b_map['dub-002']
+        self.assertTrue(b2['requires_script_shortening'])
+        # Because dub-002 overlaps with SPEAKER_01 in source, it is anchored; dub-006 starts at 13.50s (minus 0.04s pause = 13.46s ceiling -> 11.56s max duration)
+        self.assertAlmostEqual(b2['max_allowable_duration_seconds'],11.56,places=2)
+        self.assertAlmostEqual(b2['required_reduction_seconds'],5.00,places=2)
+        self.assertLess(b2['target_mora_budget'],b2['current_mora_count'])
+        self.assertGreater(b2['mora_reduction_needed'],20)
+        # Cross-speaker overlapping turn dub-004 has no same-speaker collision and needs 0 reduction.
+        self.assertFalse(b_map['dub-004']['requires_script_shortening'])
+        self.assertEqual(b_map['dub-004']['required_reduction_seconds'],0.0)
+
+
+if __name__ == '__main__':
+    unittest.main()
