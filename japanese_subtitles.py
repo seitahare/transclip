@@ -7,6 +7,7 @@ from pre-TTS raw translations.
 import argparse
 from dataclasses import asdict, dataclass, field
 import fcntl
+from difflib import SequenceMatcher
 import json
 import math
 from pathlib import Path
@@ -153,7 +154,7 @@ def wrap_clause_units(units, *, max_chars_per_line=22, max_lines=2):
 
     for unit in units:
         u_len = len(unit)
-        if current_group and current_len + u_len > max_cue_chars:
+        if current_group and (current_len + u_len > max_cue_chars or re.search(r"[。！？!?]$", current_group[-1])):
             cue_groups.append(current_group)
             current_group = [unit]
             current_len = u_len
@@ -193,9 +194,50 @@ def wrap_clause_units(units, *, max_chars_per_line=22, max_lines=2):
     return formatted_cues
 
 
+def _word_aligned_cues(entry, style, alignment):
+    """Map script clauses to monotonic WAV-bound ASR words, never replace script text."""
+    if alignment.get("time_basis") != "wav_relative" or not entry.get("audio_file"):
+        raise ValueError("WAV-relative alignment and source audio are required.")
+    if alignment.get("audio_sha256") != sha256_file(entry["audio_file"]):
+        raise ValueError("Alignment belongs to a different WAV.")
+    text = entry["text_ja"].strip()
+    # Punctuation defines sentence/clause units; layout wrapping may split long clauses further.
+    phrases = re.findall(r"[^。！？!?、，]+[。！？!?、，]*", text)
+    specs = []
+    for phrase in phrases:
+        specs.extend(wrap_clause_units(split_japanese_clauses(phrase), max_chars_per_line=style.max_chars_per_line, max_lines=style.max_lines))
+    script = "".join(_normalize_for_comparison(c["text"]) for c in specs)
+    recognized = ""; times = []; previous = 0.0
+    duration = float(entry["actual_tts_duration_seconds"])
+    for w in alignment["words"]:
+        a, b = w.get("start"), w.get("end")
+        if type(a) not in (int,float) or type(b) not in (int,float) or not (math.isfinite(a) and math.isfinite(b) and previous <= a < b <= duration + .05):
+            raise ValueError("Invalid/non-monotonic word timing.")
+        word = _normalize_for_comparison(w.get("word", ""))
+        recognized += word; times.extend([(a,b)] * len(word)); previous = b
+    mapping = {}
+    for block in SequenceMatcher(None, script, recognized, autojunk=False).get_matching_blocks():
+        mapping.update({block.a+i:times[block.b+i] for i in range(block.size)})
+    if not script or len(mapping)/len(script) < .85:
+        raise ValueError("Insufficient script-to-audio alignment coverage.")
+    warnings = [] if script == recognized else ["asr_transcript_differs_from_tts_script"]
+    warnings.append("asr_word_timing_requires_listening_review")
+    cues=[]; offset=0; start=float(entry.get("placement_seconds",entry.get("relative_start",0)));last=start
+    for index,spec in enumerate(specs):
+        size=len(_normalize_for_comparison(spec["text"]))
+        matched=[mapping[i] for i in range(offset,offset+size) if i in mapping];offset+=size
+        if not matched or len(matched)/max(size,1)<.7:raise ValueError("Clause is not sufficiently aligned.")
+        a=start+matched[0][0];b=min(start+duration,start+matched[-1][1])
+        if a<last-1e-6 or b<=a:raise ValueError("Clause boundaries overlap or are empty.")
+        cues.append({"entry_id":entry["id"],"cue_index":index,"speaker":entry["speaker"],"start":round(a,4),"end":round(b,4),
+                     "text_ja":spec["text"],"lines":spec["lines"],"timing_source":"wav_bound_whisper_words", "alignment_warnings":warnings.copy()})
+        last=b
+    return cues,warnings
+
+
 def align_entry_cues(entry, style: SubtitleStyleConfig, alignment_entry=None):
     """Create time-aligned subtitle cues for one completed TTS utterance."""
-    start = float(entry.get("placement_seconds", entry["relative_start"]))
+    start = float(entry.get("placement_seconds", entry.get("relative_start", 0)))
     duration = float(entry["actual_tts_duration_seconds"])
     end = start + duration
     text_ja = entry["text_ja"].strip()
@@ -208,6 +250,12 @@ def align_entry_cues(entry, style: SubtitleStyleConfig, alignment_entry=None):
     )
 
     warnings = []
+    if alignment_entry is not None and "words" in alignment_entry:
+        try:
+            return _word_aligned_cues(entry, style, alignment_entry)
+        except (ValueError, KeyError, OSError) as error:
+            warnings.append("word_alignment_rejected:" + str(error))
+            alignment_entry = None
     timing_source = "tts_measured_proportional"
     if alignment_entry is not None:
         recognized_text = alignment_entry.get("recognized_text", "")
@@ -217,11 +265,13 @@ def align_entry_cues(entry, style: SubtitleStyleConfig, alignment_entry=None):
         segments = alignment_entry.get("segments")
         if isinstance(segments, list) and len(segments) == len(cue_specs):
             valid_segs = True
+            previous_end = start - .05
             for seg in segments:
                 s_a, s_b = seg.get("relative_start"), seg.get("relative_end")
-                if type(s_a) not in (int, float) or type(s_b) not in (int, float) or not (start - 0.05 <= s_a < s_b <= end + 0.05):
+                if type(s_a) not in (int, float) or type(s_b) not in (int, float) or not (previous_end <= s_a < s_b <= end + 0.05):
                     valid_segs = False
                     break
+                previous_end = s_b
             if valid_segs:
                 timing_source = "forced_or_whisper_alignment"
                 cues = []
@@ -241,6 +291,7 @@ def align_entry_cues(entry, style: SubtitleStyleConfig, alignment_entry=None):
         elif segments is not None:
             warnings.append("alignment_segment_count_mismatch_used_proportional")
 
+    warnings.append("proportional_timing_not_audio_alignment")
     total_weight = sum(c["weight"] for c in cue_specs)
     cursor = start
     cues = []
