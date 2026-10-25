@@ -1,4 +1,4 @@
-"""Coverage, editorial review and acoustic evidence without implicit approval."""
+"""Coverage, editorial review, automated anomaly detection, and acoustic evidence without implicit approval."""
 import argparse
 import copy
 import hashlib
@@ -24,6 +24,107 @@ def sha(path):
     with Path(path).open('rb') as f:
         for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
     return h.hexdigest()
+
+
+def detect_quality_anomalies(
+    *,
+    timing_diagnostics=None,
+    subtitle_report=None,
+    mix_report=None,
+    voice_evaluation=None,
+):
+    """Phase 13 automated quality anomaly detector for arbitrary videos.
+
+    Detects:
+    - Utterance timing drift & early TTS finishes (`timing_anomalies`)
+    - Long silence intervals & undubbed source speech (`silence_and_undubbed_anomalies`)
+    - Mid-utterance or boundary audio truncation (`audio_truncation_anomalies`)
+    - Subtitle line overflow (`subtitle_overflow_anomalies`)
+    - Audio clipping or loudness anomalies (`audio_loudness_anomalies`)
+    """
+    t_diag = timing_diagnostics or {}
+    sub_rep = subtitle_report or {}
+    m_rep = mix_report or {}
+    v_eval = voice_evaluation or {}
+
+    timing_anomalies = []
+    for rec in t_diag.get('lip_sync_drift_records', []):
+        if rec.get('drift_exceeds_threshold'):
+            timing_anomalies.append({
+                'kind': 'excessive_lip_sync_drift',
+                'id': rec.get('id'),
+                'speaker': rec.get('speaker'),
+                'start_drift_seconds': rec.get('start_drift_seconds'),
+                'end_drift_seconds': rec.get('end_drift_seconds'),
+            })
+    for ef in t_diag.get('early_tts_finishes', []):
+        timing_anomalies.append({
+            'kind': 'tts_ends_early',
+            'id': ef.get('id'),
+            'speaker': ef.get('speaker'),
+            'early_finish_seconds': ef.get('early_finish_seconds'),
+        })
+
+    silence_and_undubbed = []
+    for ls in t_diag.get('long_silence_gaps', []):
+        silence_and_undubbed.append({
+            'kind': 'long_silence_gap',
+            'clip_relative_start_seconds': ls.get('clip_relative_start_seconds'),
+            'clip_relative_end_seconds': ls.get('clip_relative_end_seconds'),
+            'duration_seconds': ls.get('duration_seconds'),
+            'classification': ls.get('classification'),
+        })
+    for ud in t_diag.get('undubbed_active_speech_intervals', []):
+        silence_and_undubbed.append({
+            'kind': 'undubbed_active_source_speech',
+            'source_id': ud.get('source_id'),
+            'speaker': ud.get('speaker'),
+            'source_start_seconds': ud.get('source_start_seconds'),
+            'source_end_seconds': ud.get('source_end_seconds'),
+        })
+
+    truncation_anomalies = list(t_diag.get('audio_truncation_events', []))
+
+    ov_check = sub_rep.get('overflow_check') or {}
+    subtitle_overflow_anomalies = list(ov_check.get('overflow_cues', []))
+
+    loudness_metrics = m_rep.get('loudness_verification') or {}
+    audio_loudness_anomalies = []
+    if loudness_metrics.get('clipped_sample_count', 0) > 0 or loudness_metrics.get('clipping_free') is False:
+        audio_loudness_anomalies.append({
+            'kind': 'audio_clipping_detected',
+            'clipped_sample_count': loudness_metrics.get('clipped_sample_count'),
+            'peak_amplitude': loudness_metrics.get('peak_amplitude'),
+        })
+    for nw in v_eval.get('naturalness_warnings', []):
+        audio_loudness_anomalies.append({
+            'kind': 'voice_naturalness_warning',
+            'id': nw.get('id'),
+            'speaker': nw.get('speaker'),
+            'issues': nw.get('issues'),
+        })
+
+    has_critical_anomalies = bool(
+        truncation_anomalies
+        or subtitle_overflow_anomalies
+        or any(a.get('kind') == 'audio_clipping_detected' for a in audio_loudness_anomalies)
+    )
+
+    return {
+        'timing_anomalies': timing_anomalies,
+        'silence_and_undubbed_anomalies': silence_and_undubbed,
+        'audio_truncation_anomalies': truncation_anomalies,
+        'subtitle_overflow_anomalies': subtitle_overflow_anomalies,
+        'audio_loudness_anomalies': audio_loudness_anomalies,
+        'has_critical_anomalies': has_critical_anomalies,
+        'total_anomaly_count': (
+            len(timing_anomalies)
+            + len(silence_and_undubbed)
+            + len(truncation_anomalies)
+            + len(subtitle_overflow_anomalies)
+            + len(audio_loudness_anomalies)
+        ),
+    }
 
 
 def completion_assessment(script_rows, feedback_rows, *, selection, source_rows=None,
@@ -57,6 +158,8 @@ def completion_assessment(script_rows, feedback_rows, *, selection, source_rows=
     if speaker_targets:blockers.append('speaker_review_pending')
     if pending:blockers.append('script_or_audio_review_pending')
     if sub.get('review_required',True):blockers.append('subtitle_review_pending')
+    if (sub.get('overflow_check') or {}).get('overflow_count', 0) > 0:
+        blockers.append('subtitle_overflow_detected')
     if time.get('unresolved_same_speaker_collisions'):blockers.append('same_speaker_collision')
     if time.get('unresolved_inter_speaker_overlaps') or time.get('boundary_overflows'):blockers.append('timeline_review_pending')
     # Absence of review flags is not a listening confirmation.

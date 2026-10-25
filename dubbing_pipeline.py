@@ -799,26 +799,32 @@ def _evaluate_pair_continuity(curr, nxt, *, max_merge_gap_seconds=1.5):
         return []
 
     gap = float(nxt["start"]) - float(curr["end"])
-    num_a = curr.get("numeric_id")
-    num_b = nxt.get("numeric_id")
-    is_target_split_ids = num_a in (64, 65) and num_b == num_a + 1
+    en_a = str(curr.get("text_en") or "").strip()
+    en_b = str(nxt.get("text_en") or "").strip()
+    ja_a = str(curr.get("text_ja") or "").strip()
+    ja_b = str(nxt.get("text_ja") or "").strip()
+
+    has_comma_or_clause_continuation = bool(
+        en_a.endswith(",")
+        or en_a.endswith("...")
+        or any(
+            re.sub(r"[。！？!?「」『』（）()\s]+$", "", ja_a).endswith(s)
+            for s in _JA_CONJUNCTIVE_CLAUSE_ENDINGS
+        )
+    )
 
     # Self-overlap barrier (`test_self_overlap_detected_without_merging`), allowing minor ASR boundary jitter (-0.30s)
     if gap < -0.30 or float(nxt["start"]) <= float(curr["start"]) + 0.25 or float(nxt["end"]) <= float(curr["end"]):
         return []
-    if gap < -0.05 and not is_target_split_ids:
+    if gap < -0.05 and not has_comma_or_clause_continuation:
         return []
 
-    effective_max_gap = max(float(max_merge_gap_seconds), 3.0) if is_target_split_ids else float(max_merge_gap_seconds)
+    effective_max_gap = float(max_merge_gap_seconds)
     # Long-gap barrier (`test_long_gap_not_merged`)
     if gap > effective_max_gap + 1e-6:
         return []
 
     reasons = []
-    en_a = str(curr.get("text_en") or "").strip()
-    en_b = str(nxt.get("text_en") or "").strip()
-    ja_a = str(curr.get("text_ja") or "").strip()
-    ja_b = str(nxt.get("text_ja") or "").strip()
 
     # 1. English non-terminal ending or continuation token
     if en_a:
@@ -857,10 +863,7 @@ def _evaluate_pair_continuity(curr, nxt, *, max_merge_gap_seconds=1.5):
                 reasons.append(f"ja_next_starts_with_connector:{prefix}")
                 break
 
-    # 5. Consecutive IDs 64..66 or closely-spaced short clauses of the same sentence
-    if is_target_split_ids:
-        reasons.append(f"target_split_sentence_ids:{num_a}_{num_b}")
-
+    # 5. Closely-spaced short clauses of the same sentence
     dur_a = float(curr["end"]) - float(curr["start"])
     dur_b = float(nxt["end"]) - float(nxt["start"])
     if gap <= 0.65 and (dur_a <= 3.5 or dur_b <= 3.5) and (float(nxt["end"]) - float(curr["start"])) <= 14.0:
@@ -1343,10 +1346,14 @@ def resolve_speaker_voice_plan(
     preset_speaker_map=None,
     default_preset_voice=None,
     allow_preset_fallback=True,
+    speaker_age_map=None,
+    speaker_atmosphere_map=None,
+    auto_select_preset=False,
 ):
-    """Build per-speaker voice routing while enforcing X-vector priority and rights governance.
+    """Build per-speaker voice routing while enforcing X-vector priority, rights governance,
+    and Phase 13 age/atmosphere-based preset voice selection.
 
-    - When `voice_mode="xvector"` or `allow_preset_fallback=False` (Phase 12 default):
+    - When `voice_mode="xvector"` or `allow_preset_fallback=False` (Phase 12/13 default):
       X-vector synthesis is mandatory for all speakers not explicitly mapped via `--preset-speaker`.
       Never silently falls back to `default_preset_voice` or `utterance["preset_voice"]`; raises
       `XVectorSynthesisError` / `UnauthorizedSpeakerError` if a speaker lacks a valid X-vector reference!
@@ -1365,6 +1372,8 @@ def resolve_speaker_voice_plan(
     preset_map = dict(preset_speaker_map or {})
     profiles = dict(voice_profiles or {})
     tech_refs = dict(technical_references or {})
+    age_map = dict(speaker_age_map or {})
+    atm_map = dict(speaker_atmosphere_map or {})
     active_rights_policy = rights_policy or RightsAndPublicationPolicy(rights_mode="permitted_local")
 
     utterances = (
@@ -1391,6 +1400,7 @@ def resolve_speaker_voice_plan(
     routing_details = []
     governance_records = []
     uses_technical_reference = False
+    used_presets = set()
 
     for spk in speakers:
         if _is_null_or_unassigned_speaker(spk):
@@ -1400,16 +1410,34 @@ def resolve_speaker_voice_plan(
 
         # Explicit Preset mode (`--voice-mode preset` or explicit `--preset-speaker SPK=Voice`)
         if voice_mode == "preset" or spk in preset_map:
-            assigned_preset = preset_map.get(spk) or (
-                (default_preset_voice or _utterance_preset_fallback(utterances, spk))
-                if voice_mode == "preset"
-                else None
-            )
+            preset_recommendation = None
+            assigned_preset = preset_map.get(spk)
+            if not assigned_preset and voice_mode == "preset":
+                if auto_select_preset or spk in age_map or spk in atm_map:
+                    from voice_quality import recommend_preset_voice
+                    f0_hint = None
+                    if spk in tech_refs and Path(tech_refs[spk].reference_audio).is_file():
+                        try:
+                            pr_metrics = analyze_japanese_prosody(tech_refs[spk].reference_audio)
+                            f0_hint = pr_metrics.get("f0_hz_median")
+                        except Exception:
+                            f0_hint = None
+                    preset_recommendation = recommend_preset_voice(
+                        spk,
+                        f0_hz=f0_hint,
+                        age_hint=age_map.get(spk),
+                        atmosphere_hint=atm_map.get(spk),
+                        avoid_voices=used_presets,
+                    )
+                    assigned_preset = preset_recommendation["recommended_voice"]
+                else:
+                    assigned_preset = default_preset_voice or _utterance_preset_fallback(utterances, spk)
             if not assigned_preset:
                 raise UnauthorizedSpeakerError(
                     f"Speaker {spk!r} requires an explicit preset voice in preset mode; "
-                    f"specify --preset-speaker {spk}=Ryan or --default-preset-voice Ryan."
+                    f"specify --preset-speaker {spk}=Ryan, --default-preset-voice Ryan, or --auto-select-preset."
                 )
+            used_presets.add(assigned_preset)
             voices[spk] = assigned_preset
             speaker_modes[spk] = "preset"
             routing_details.append(
@@ -1419,8 +1447,13 @@ def resolve_speaker_voice_plan(
                     "voice": assigned_preset,
                     "clone_method": None,
                     "x_vector_only_mode": False,
-                    "authorization_status": "explicit_preset_mode" if voice_mode == "preset" else "explicit_preset_speaker_override",
+                    "authorization_status": (
+                        "auto_selected_preset_by_age_atmosphere"
+                        if preset_recommendation
+                        else ("explicit_preset_mode" if voice_mode == "preset" else "explicit_preset_speaker_override")
+                    ),
                     "profile_fingerprint": None,
+                    **({"preset_recommendation": preset_recommendation} if preset_recommendation else {}),
                 }
             )
             continue
@@ -1458,7 +1491,7 @@ def resolve_speaker_voice_plan(
             )
             continue
 
-        # 2. Check decoupled `TechnicalVoiceReference` (Phase 12 X-vector primary path)
+        # 2. Check decoupled `TechnicalVoiceReference` (Phase 12/13 X-vector primary path)
         if spk in tech_refs:
             tref = tech_refs[spk]
             snap = tref.technical_snapshot()
@@ -1501,14 +1534,25 @@ def resolve_speaker_voice_plan(
                 f"or explicitly request Preset via --preset-speaker {spk}=Ryan."
             )
 
-        # Legacy Phase 11 `voice_mode="auto"` with explicit `--default-preset-voice`
+        # Legacy Phase 11 `voice_mode="auto"` with explicit `--default-preset-voice` or `--auto-select-preset`
+        preset_recommendation = None
         assigned_preset = default_preset_voice
+        if not assigned_preset and (auto_select_preset or spk in age_map or spk in atm_map):
+            from voice_quality import recommend_preset_voice
+            preset_recommendation = recommend_preset_voice(
+                spk,
+                age_hint=age_map.get(spk),
+                atmosphere_hint=atm_map.get(spk),
+                avoid_voices=used_presets,
+            )
+            assigned_preset = preset_recommendation["recommended_voice"]
         if not assigned_preset:
             raise UnauthorizedSpeakerError(
                 f"Speaker {spk!r} does not have an approved VoiceProfile. "
                 f"Cloning unauthorized or real-person voices is strictly prohibited. "
                 f"Assign an explicit preset voice with --preset-speaker {spk}=Ryan or --default-preset-voice Ryan."
             )
+        used_presets.add(assigned_preset)
         voices[spk] = assigned_preset
         speaker_modes[spk] = "preset"
         routing_details.append(
@@ -1520,6 +1564,7 @@ def resolve_speaker_voice_plan(
                 "x_vector_only_mode": False,
                 "authorization_status": "unapproved_speaker_routed_to_explicit_preset",
                 "profile_fingerprint": None,
+                **({"preset_recommendation": preset_recommendation} if preset_recommendation else {}),
             }
         )
 
@@ -1678,18 +1723,30 @@ def _apply_bounded_atempo_non_destructive(
     *,
     utterance_id,
     target_duration_seconds,
+    min_atempo=1.0,
     max_atempo=1.25,
     ffmpeg_bin=None,
 ):
-    """Apply bounded FFmpeg `atempo` time-stretching into a new file in `output_dir`, never modifying `wav_path`."""
+    """Apply bounded FFmpeg `atempo` time-stretching (supporting 0.90..1.30x bidirectional slot fitting)
+    into a new file in `output_dir`, never modifying `wav_path`.
+    """
     samples, rate = _read_wav_float32(wav_path)
     cur_dur = len(samples) / float(rate)
-    if target_duration_seconds <= 0.05 or cur_dur <= target_duration_seconds + 0.01:
+    if target_duration_seconds <= 0.05:
         return Path(wav_path), round(cur_dur, 4), 1.0, False
 
-    req_ratio = cur_dur / float(target_duration_seconds)
-    applied_ratio = min(float(max_atempo), max(1.0, req_ratio))
-    if applied_ratio <= 1.015:
+    from timing_adjustment import compute_auto_speech_rate_ratio
+    eff_min = max(0.5, min(1.0, float(min_atempo)))
+    eff_max = max(1.0, min(2.0, float(max_atempo)))
+    rate_plan = compute_auto_speech_rate_ratio(
+        cur_dur,
+        target_duration_seconds,
+        min_atempo=eff_min,
+        max_atempo=eff_max,
+        deadband=0.015,
+    )
+    applied_ratio = float(rate_plan["applied_atempo"])
+    if abs(applied_ratio - 1.0) <= 0.015:
         return Path(wav_path), round(cur_dur, 4), 1.0, False
 
     out_d = Path(output_dir).resolve()
@@ -1733,10 +1790,18 @@ def analyze_timeline_collisions_and_overlaps(
     max_timing_shift=0.5,
     max_inter_speaker_shift=0.0,
     auto_tempo_adjust=False,
+    min_atempo=0.90,
     max_atempo=1.25,
+    fit_utterance_slots=False,
     adjusted_wav_dir=None,
+    source_utterances=None,
 ):
-    """Detect same-speaker collisions & inter-speaker overlaps, measure overflows, and apply bounded adjustments."""
+    """Detect same-speaker collisions & inter-speaker overlaps, measure overflows,
+    align semantic clause units, apply bounded 0.90..1.30x tempo & timing adjustments,
+    and detect timing/silence/truncation anomalies.
+    """
+    from timing_adjustment import align_semantic_units_to_utterance_window, detect_timing_and_coverage_anomalies
+
     norm_entries = []
     duration_adjustments = []
 
@@ -1791,6 +1856,12 @@ def analyze_timeline_collisions_and_overlaps(
                     }
                 )
 
+        semantic_units = align_semantic_units_to_utterance_window({
+            **row,
+            "source_start": src_start,
+            "source_end": src_end,
+        })
+
         norm_entries.append(
             {
                 "index": idx,
@@ -1809,6 +1880,7 @@ def analyze_timeline_collisions_and_overlaps(
                 "placement_end": place_start + cur_dur,
                 "original_audio_file": str(wav_file) if wav_file else None,
                 "active_audio_file": active_wav,
+                "semantic_units": semantic_units,
             }
         )
 
@@ -1837,7 +1909,7 @@ def analyze_timeline_collisions_and_overlaps(
                     }
                 )
 
-    # Optional bounded non-destructive atempo when auto_tempo_adjust=True and utterance overflows barrier
+    # Optional bounded non-destructive atempo when auto_tempo_adjust=True
     if auto_tempo_adjust and adjusted_wav_dir:
         for i, item in enumerate(norm_entries):
             if not item["active_audio_file"] or not Path(item["active_audio_file"]).is_file():
@@ -1856,12 +1928,22 @@ def analyze_timeline_collisions_and_overlaps(
                         barriers.append(other["source_start"] + float(max_inter_speaker_shift))
                         break
             avail_span = min(barriers) - item["placement_start"]
-            if item["actual_duration"] > avail_span + 0.02 and avail_span >= 0.30:
+            target_span = min(avail_span, item["slot_duration"]) if fit_utterance_slots else avail_span
+            needs_speedup = item["actual_duration"] > target_span + 0.02 and target_span >= 0.30
+            needs_slowdown = (
+                fit_utterance_slots
+                and float(min_atempo) < 1.0
+                and item["actual_duration"] < item["slot_duration"] * 0.88
+                and item["slot_duration"] <= avail_span + 0.01
+                and item["slot_duration"] >= 0.50
+            )
+            if needs_speedup or needs_slowdown:
                 adj_wav, adj_dur, ratio, did_tempo = _apply_bounded_atempo_non_destructive(
                     item["active_audio_file"],
                     adjusted_wav_dir,
                     utterance_id=item["id"],
-                    target_duration_seconds=avail_span,
+                    target_duration_seconds=item["slot_duration"] if needs_slowdown else target_span,
+                    min_atempo=min_atempo if fit_utterance_slots else 1.0,
                     max_atempo=max_atempo,
                 )
                 if did_tempo:
@@ -1874,7 +1956,7 @@ def analyze_timeline_collisions_and_overlaps(
                         {
                             "id": item["raw_id"],
                             "speaker": item["speaker"],
-                            "stage": "bounded_atempo",
+                            "stage": "bounded_atempo_slowdown" if ratio < 1.0 else "bounded_atempo",
                             "original_duration_seconds": round(prev_d, 4),
                             "adjusted_duration_seconds": adj_dur,
                             "atempo_ratio": ratio,
@@ -2016,6 +2098,7 @@ def analyze_timeline_collisions_and_overlaps(
             "shift_seconds": round(item["placement_start"] - item["source_start"], 4),
             "active_audio_file": item["active_audio_file"],
             "original_audio_file": item["original_audio_file"],
+            "semantic_units": item.get("semantic_units", []),
         }
         shifted_placements[item["id"]] = placement_info
         shifted_placements[item["raw_id"]] = placement_info
@@ -2036,6 +2119,13 @@ def analyze_timeline_collisions_and_overlaps(
     except ImportError:
         pass
 
+    timing_sync_diagnostics = detect_timing_and_coverage_anomalies(
+        norm_entries,
+        selection_start=selection_start,
+        selection_end=selection_end,
+        source_utterances=source_utterances,
+    )
+
     # Export JSON-serializable placements keyed by string utterance ID
     serializable_placements = {str(item["id"]): shifted_placements[item["id"]] for item in norm_entries}
 
@@ -2045,12 +2135,16 @@ def analyze_timeline_collisions_and_overlaps(
         "clip_duration_seconds": round(float(selection_end) - float(selection_start), 4),
         "max_timing_shift_seconds": round(float(max_timing_shift), 4),
         "max_inter_speaker_shift_seconds": round(float(max_inter_speaker_shift), 4),
+        "min_atempo": round(float(min_atempo), 4),
+        "max_atempo": round(float(max_atempo), 4),
+        "fit_utterance_slots": bool(fit_utterance_slots),
         "initial_same_speaker_collisions": initial_same_speaker_collisions,
         "resolved_same_speaker_collisions": resolved_collisions,
         "unresolved_same_speaker_collisions": unresolved_collisions,
         "adjusted_inter_speaker_overlaps": adjusted_inter_speaker_overlaps,
         "preserved_other_speaker_overlaps": other_speaker_overlaps,
         "duration_adjustments": duration_adjustments,
+        "timing_sync_diagnostics": timing_sync_diagnostics,
         "placements": serializable_placements,
         "repo_collision_budget_diagnostics": repo_budget_diagnostics,
     }
@@ -2281,6 +2375,46 @@ def _prepare_clip_video_source(video_path, *, selection_start, clip_duration, wo
     return seg_mp4, probe_media_streams(seg_mp4)
 
 
+def _extract_source_audio_from_video(video_path, *, total_frames, target_sr=48000, ffmpeg_bin=None):
+    """Extract mono 48kHz float32 audio array of length `total_frames` from `video_path` when available."""
+    if not video_path or not Path(str(video_path)).is_file():
+        return None
+    ffmpeg_exec = ffmpeg_bin or _resolve_binary("ffmpeg")
+    duration_sec = total_frames / float(target_sr)
+    cmd = [
+        ffmpeg_exec,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{duration_sec:.4f}",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(target_sr),
+        "-c:a",
+        "pcm_f32le",
+        "-f",
+        "f32le",
+        "pipe:1",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    arr = np.frombuffer(proc.stdout, dtype="<f4").astype(np.float32)
+    if not np.isfinite(arr).all() or len(arr) == 0:
+        return None
+    if len(arr) >= total_frames:
+        return arr[:total_frames].copy()
+    padded = np.zeros(total_frames, dtype=np.float32)
+    padded[: len(arr)] = arr
+    return padded
+
+
 def _fallback_mix_audio_and_video(
     *,
     video_path,
@@ -2289,14 +2423,32 @@ def _fallback_mix_audio_and_video(
     selection_start,
     clip_duration,
     output_dir,
+    mix_mode="voiceover",
+    duck_gain=0.12,
+    unspoken_gain=1.0,
+    tts_gain=1.0,
+    fade_out_seconds=0.18,
+    fade_in_seconds=0.25,
+    ambient_backend="auto",
+    ambient_gain=0.85,
     ffmpeg_bin=None,
 ):
-    """48kHz sample-accurate multi-speaker audio mixer & MP4 muxer preserving the original video stream."""
+    """48kHz sample-accurate multi-speaker audio mixer & MP4 muxer with Phase 13 voice-over ducking,
+    ambient sound separation, soft-knee peak limiting, and loudness/clipping verification.
+    """
+    from audio_mixer import (
+        apply_soft_limiter,
+        build_ducking_envelope,
+        separate_ambient_and_speech,
+        verify_audio_loudness_and_clipping,
+    )
+
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     target_sr = 48000
     total_frames = int(round(float(clip_duration) * target_sr))
     speaker_tracks = {}
+    speech_intervals = []
 
     for entry in feedback_doc.get("entries", []):
         if entry.get("generation_status") != "complete":
@@ -2324,13 +2476,14 @@ def _fallback_mix_audio_and_video(
         if end_frame > start_frame:
             track = speaker_tracks.setdefault(spk, np.zeros(total_frames, dtype=np.float64))
             track[start_frame:end_frame] += samples[: end_frame - start_frame].astype(np.float64)
+            speech_intervals.append((rel_start, end_frame / float(target_sr)))
 
-    master = np.zeros(total_frames, dtype=np.float64)
+    japanese_master = np.zeros(total_frames, dtype=np.float64)
     tracks_dir = out_dir / "tracks"
     tracks_dir.mkdir(parents=True, exist_ok=True)
     speaker_track_files = {}
     for spk, trk in speaker_tracks.items():
-        master += trk
+        japanese_master += trk * float(tts_gain)
         trk_pcm = np.clip(np.round(trk * 32767.0), -32768, 32767).astype("<i2")
         trk_path = tracks_dir / f"{spk}.wav"
         with wave.open(str(trk_path), "wb") as stream:
@@ -2340,11 +2493,93 @@ def _fallback_mix_audio_and_video(
             stream.writeframes(trk_pcm.tobytes())
         speaker_track_files[spk] = str(trk_path)
 
-    peak = float(np.max(np.abs(master))) if len(master) else 0.0
-    gain = 1.0
-    if peak > 0.95:
-        gain = 0.95 / peak
-        master = master * gain
+    # Save pure Japanese TTS track for inspection
+    jp_only_wav = out_dir / "japanese_tts_only.wav"
+    jp_pcm = np.clip(np.round(japanese_master * 32767.0), -32768, 32767).astype("<i2")
+    with wave.open(str(jp_only_wav), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(target_sr)
+        stream.writeframes(jp_pcm.tobytes())
+
+    normalized_mode = str(mix_mode or "voiceover").strip().lower()
+    if normalized_mode in ("normal", "diagnostic"):
+        normalized_mode = "voiceover"
+    if normalized_mode == "full-dub":
+        normalized_mode = "japanese-only"
+
+    source_audio = None
+    if normalized_mode != "japanese-only":
+        source_audio = _extract_source_audio_from_video(
+            video_path,
+            total_frames=total_frames,
+            target_sr=target_sr,
+            ffmpeg_bin=ffmpeg_bin,
+        )
+
+    ducking_envelope_report = None
+    ambient_separation_report = None
+    background_track = np.zeros(total_frames, dtype=np.float64)
+    ambient_wav_path = None
+
+    if source_audio is not None and normalized_mode != "japanese-only":
+        env, ducking_envelope_report = build_ducking_envelope(
+            total_frames,
+            sample_rate=target_sr,
+            speech_intervals=speech_intervals,
+            duck_gain=float(duck_gain),
+            unspoken_gain=float(unspoken_gain),
+            fade_out_seconds=float(fade_out_seconds),
+            fade_in_seconds=float(fade_in_seconds),
+        )
+        if normalized_mode == "reference-mix":
+            background_track = source_audio.astype(np.float64) * float(duck_gain)
+        elif normalized_mode in ("ambient", "separated-ambient", "hybrid-ambient"):
+            sep = separate_ambient_and_speech(
+                source_audio,
+                sample_rate=target_sr,
+                backend=ambient_backend,
+                allow_fallback=True,
+            )
+            ambient_separation_report = {
+                k: v for k, v in sep.items() if k not in ("ambient", "speech")
+            }
+            amb_stem = sep["ambient"].astype(np.float64)
+            spk_stem = sep["speech"].astype(np.float64)
+
+            # Export separated ambient stem for verification
+            ambient_wav_path = out_dir / "ambient_bed.wav"
+            amb_pcm = np.clip(np.round(amb_stem * 32767.0), -32768, 32767).astype("<i2")
+            with wave.open(str(ambient_wav_path), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(target_sr)
+                stream.writeframes(amb_pcm.tobytes())
+
+            denom = max(1e-6, abs(float(unspoken_gain) - float(duck_gain)))
+            speech_weight = np.clip((float(unspoken_gain) - env) / denom, 0.0, 1.0).astype(np.float64)
+            residual_voice_gain = float(duck_gain) if normalized_mode == "hybrid-ambient" else float(duck_gain) * 0.35
+            bg_during_speech = amb_stem * float(ambient_gain) + spk_stem * residual_voice_gain
+            bg_unspoken = source_audio.astype(np.float64) * float(unspoken_gain)
+            background_track = speech_weight * bg_during_speech + (1.0 - speech_weight) * bg_unspoken
+        else:
+            # Voiceover / ducking mode: 10-15% original audio during TTS speech, full unspoken_gain in gaps
+            background_track = source_audio.astype(np.float64) * env.astype(np.float64)
+
+    raw_master = japanese_master + background_track
+    limited_master, limiter_report = apply_soft_limiter(raw_master, ceiling=0.95, knee=0.75)
+    master = limited_master.astype(np.float64)
+    pre_peak = float(limiter_report["pre_peak"])
+    gain = round(float(limiter_report["post_peak"]) / pre_peak, 5) if pre_peak > 0.95 else 1.0
+
+    loudness_verification = verify_audio_loudness_and_clipping(
+        master,
+        japanese_samples=japanese_master,
+        background_samples=background_track,
+        source_samples=source_audio,
+        sample_rate=target_sr,
+        speech_intervals=speech_intervals,
+    )
 
     master_pcm = np.clip(np.round(master * 32767.0), -32768, 32767).astype("<i2")
     dubbed_wav = out_dir / "dubbed_audio.wav"
@@ -2410,12 +2645,22 @@ def _fallback_mix_audio_and_video(
 
     mix_report = {
         "kind": "transclip_mix_report",
-        "format_version": 1,
+        "format_version": 2,
+        "mix_mode": normalized_mode,
+        "duck_gain": float(duck_gain) if normalized_mode != "japanese-only" else 0.0,
+        "unspoken_gain": float(unspoken_gain) if normalized_mode != "japanese-only" else 0.0,
+        "tts_gain": float(tts_gain),
         "sample_rate": target_sr,
         "clip_duration_seconds": round(float(clip_duration), 4),
         "static_gain": round(gain, 5),
         "peak_amplitude": round(float(np.max(np.abs(master))) if len(master) else 0.0, 5),
+        "limiter": limiter_report,
+        "ducking_envelope": ducking_envelope_report,
+        "ambient_separation": ambient_separation_report,
+        "loudness_verification": loudness_verification,
         "dubbed_audio_wav": str(dubbed_wav),
+        "japanese_tts_only_wav": str(jp_only_wav),
+        "ambient_bed_wav": str(ambient_wav_path) if ambient_wav_path else None,
         "dubbed_video_mp4": str(dubbed_mp4),
         "speaker_tracks": speaker_track_files,
         "entries": mix_entries,
@@ -2435,14 +2680,21 @@ def _invoke_audio_mixer(
     placements_map,
     selection_start,
     clip_duration,
-    mode="normal",
+    mode="voiceover",
+    duck_gain=0.12,
+    unspoken_gain=1.0,
+    tts_gain=1.0,
+    fade_out_seconds=0.18,
+    fade_in_seconds=0.25,
+    ambient_backend="auto",
+    ambient_gain=0.85,
     max_timing_shift=0.5,
     prefer_internal_mixer=False,
 ):
-    """Invoke repository `audio_mixer.py` if compatible, or use the 48kHz clip-relative mixer."""
+    """Invoke repository `audio_mixer.py` if compatible, or use the 48kHz clip-relative voiceover/ambient mixer."""
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    if not prefer_internal_mixer:
+    if not prefer_internal_mixer and mode in ("normal", "diagnostic", "japanese-only", "reference-mix"):
         try:
             import audio_mixer
 
@@ -2494,6 +2746,14 @@ def _invoke_audio_mixer(
         selection_start=selection_start,
         clip_duration=clip_duration,
         output_dir=out_dir,
+        mix_mode=mode,
+        duck_gain=duck_gain,
+        unspoken_gain=unspoken_gain,
+        tts_gain=tts_gain,
+        fade_out_seconds=fade_out_seconds,
+        fade_in_seconds=fade_in_seconds,
+        ambient_backend=ambient_backend,
+        ambient_gain=ambient_gain,
     )
 
 
@@ -2545,11 +2805,40 @@ def _fallback_generate_subtitles_and_mp4(
     speaker_verification_targets=None,
     include_unverified_subtitles=False,
     alignment_data=None,
+    subtitle_style_overrides=None,
     ffmpeg_bin=None,
 ):
-    """Generate clip-relative final_ja.srt, final_ja.ass, final_ja_no_subtitles.mp4, and final_ja.mp4."""
+    """Generate clip-relative final_ja.srt, final_ja.ass, final_ja_no_subtitles.mp4, and final_ja.mp4
+    with Phase 13 visibility (outline, shadow, semi-transparent box), 1.2-1.3x sizing, elevated margin_v,
+    resolution/aspect scaling, overflow prevention, and display punctuation formatting.
+    """
+    from dataclasses import asdict
+    from japanese_subtitles import (
+        SubtitleStyleConfig,
+        _ass_alpha_hex,
+        align_entry_cues,
+        check_subtitle_overflow,
+        format_subtitle_display_lines,
+        prevent_line_overflow,
+    )
+
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Probe video resolution to adapt subtitle size, margins, and line wrapping automatically
+    vid_w, vid_h = 1280, 720
+    if dubbed_video_path and Path(str(dubbed_video_path)).is_file():
+        try:
+            v_probe = probe_media_streams(dubbed_video_path)
+            if v_probe.get("width", 0) > 0 and v_probe.get("height", 0) > 0:
+                vid_w = int(v_probe["width"])
+                vid_h = int(v_probe["height"])
+        except Exception:
+            pass
+
+    overrides = dict(subtitle_style_overrides or {})
+    style = SubtitleStyleConfig.for_video_resolution(vid_w, vid_h, **overrides)
+
     entries = [
         copy.deepcopy(e)
         for e in rel_feedback_doc.get("entries", [])
@@ -2570,16 +2859,26 @@ def _fallback_generate_subtitles_and_mp4(
                         ),
                     }
                 )
-    from japanese_subtitles import align_entry_cues, SubtitleStyleConfig
+
     aligned_entries = []
     alignment_warnings = {}
     for entry in entries:
-        cues, warnings = align_entry_cues(entry, SubtitleStyleConfig(), (alignment_data or {}).get(str(entry["id"])))
-        if warnings: alignment_warnings[str(entry["id"])] = warnings
+        cues, warnings = align_entry_cues(entry, style, (alignment_data or {}).get(str(entry["id"])))
+        if warnings:
+            alignment_warnings[str(entry["id"])] = warnings
         for cue in cues:
-            aligned_entries.append({**entry, "text_ja": cue["text_ja"], "lines": cue.get("lines"), "placement_seconds":cue["start"],
-                "actual_tts_duration_seconds":cue["end"]-cue["start"], "cue_index":cue["cue_index"], "timing_source":cue["timing_source"]})
-    entries = sorted(aligned_entries,key=lambda e: float(e["placement_seconds"]))
+            aligned_entries.append({
+                **entry,
+                "text_ja": cue["text_ja"],
+                "lines": cue.get("lines"),
+                "display_lines": cue.get("display_lines"),
+                "display_text_ja": cue.get("display_text_ja"),
+                "placement_seconds": cue["start"],
+                "actual_tts_duration_seconds": cue["end"] - cue["start"],
+                "cue_index": cue["cue_index"],
+                "timing_source": cue["timing_source"],
+            })
+    entries = sorted(aligned_entries, key=lambda e: float(e["placement_seconds"]))
 
     speakers = []
     for e in entries:
@@ -2598,29 +2897,39 @@ def _fallback_generate_subtitles_and_mp4(
         if end_s <= start_s:
             end_s = min(float(clip_duration), start_s + 0.5)
         spk = e.get("speaker", DEFAULT_SPEAKER_ID)
-        lines = list(e.get("lines") or _wrap_japanese_lines(e["text_ja"], max_line_chars=22))
-        srt_text = "\n".join(lines)
+        raw_lines = list(e.get("lines") or _wrap_japanese_lines(e["text_ja"], max_line_chars=style.max_chars_per_line))
+        raw_lines = prevent_line_overflow(raw_lines, style)
+        disp_lines = list(
+            e.get("display_lines")
+            or format_subtitle_display_lines(raw_lines, strip_periods=style.strip_periods, comma_mode=style.comma_mode)
+        )
+        disp_lines = prevent_line_overflow(disp_lines, style)
+
+        srt_text = "\n".join(disp_lines)
         if multi_speaker or spk == "話者未確定":
             srt_text = f"[{spk}] {srt_text}"
         srt_blocks.append(f"{idx}\n{_format_srt_time(start_s)} --> {_format_srt_time(end_s)}\n{srt_text}\n")
 
         lane = speakers.index(spk) if spk in speakers else 0
-        margin_v = 36 + lane * 54
-        ass_text = "\\N".join(lines)
+        margin_v = style.margin_v + lane * style.overlap_lane_step_v
+        ass_text = "\\N".join(disp_lines)
         ass_events.append(
-            f"Dialogue: 0,{_format_ass_time(start_s)},{_format_ass_time(end_s)},Default,{spk},0,0,{margin_v},,{ass_text}"
+            f"Dialogue: {lane},{_format_ass_time(start_s)},{_format_ass_time(end_s)},Default,{spk},0,0,{margin_v},,{ass_text}"
         )
         cues_meta.append(
             {
                 "index": idx,
                 "id": e.get("id"),
+                "entry_id": e.get("id"),
                 "speaker": spk,
                 "start_seconds": round(start_s, 4),
                 "end_seconds": round(end_s, 4),
                 "text_ja": e["text_ja"],
+                "display_text_ja": "\n".join(disp_lines),
                 "cue_index": e["cue_index"],
                 "timing_source": e["timing_source"],
-                "lines": lines,
+                "lines": raw_lines,
+                "display_lines": disp_lines,
                 "margin_v": margin_v,
             }
         )
@@ -2629,15 +2938,21 @@ def _fallback_generate_subtitles_and_mp4(
     ass_path = out_dir / "final_ja.ass"
     srt_path.write_text("\n".join(srt_blocks), encoding="utf-8")
 
-    ass_header = """[Script Info]
+    border_style = 3 if style.background_box else 1
+    alpha_hex = _ass_alpha_hex(style.box_opacity)
+    outline_col = f"&H{alpha_hex}000000" if style.background_box else "&H00181818"
+    back_col = "&H80000000"
+
+    ass_header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1280
-PlayResY: 720
+PlayResX: {style.play_res_x}
+PlayResY: {style.play_res_y}
 WrapStyle: 2
+ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Hiragino Sans,36,&H00FFFFFF,&H000000FF,&H00181818,&H80000000,1,0,0,0,100,100,0,0,1,2,1,2,40,40,36,1
+Style: Default,Hiragino Sans,{style.font_size},&H00FFFFFF,&H000000FF,{outline_col},{back_col},1,0,0,0,100,100,0,0,{border_style},{style.outline},{style.shadow},{style.alignment},{style.margin_l},{style.margin_r},{style.margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -2702,18 +3017,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             shutil.copyfile(no_sub_mp4, tmp_final)
     tmp_final.replace(final_mp4)
 
+    overflow_check = check_subtitle_overflow(cues_meta, style)
+
     sub_report = {
         "kind": "transclip_subtitle_report",
-        "format_version": 1,
+        "format_version": 2,
+        "style": asdict(style),
         "cue_count": len(cues_meta),
         "cues": cues_meta,
+        "overflow_check": overflow_check,
         "held_verification_target_count": len(speaker_verification_targets or []),
         "srt_path": str(srt_path),
         "ass_path": str(ass_path),
         "final_ja_mp4": str(final_mp4),
         "final_ja_no_subtitles_mp4": str(no_sub_mp4),
         "subtitle_render_mode": subtitle_render_mode,
-        "review_required": bool(speaker_verification_targets or alignment_warnings),
+        "review_required": bool(speaker_verification_targets or alignment_warnings or overflow_check.get("overflow_count", 0) > 0),
         "alignment_warnings": alignment_warnings,
     }
     sub_report_path = out_dir / "subtitle_report.json"
@@ -2741,16 +3060,22 @@ def _invoke_japanese_subtitles(
     alignment_json_path=None,
     speaker_verification_targets=None,
     include_unverified_subtitles=False,
+    subtitle_style_overrides=None,
 ):
     """Invoke repository `japanese_subtitles.py` with clip-relative timestamps, or fallback."""
     alignment = json.loads(Path(alignment_json_path).read_text(encoding="utf-8")) if alignment_json_path else None
-    return _fallback_generate_subtitles_and_mp4(
-        rel_feedback_doc=rel_feedback_doc, dubbed_video_path=dubbed_video_path,
-        output_dir=output_dir, clip_duration=clip_duration,
-        speaker_verification_targets=speaker_verification_targets,
-        include_unverified_subtitles=include_unverified_subtitles,
-        alignment_data=alignment,
-    )
+    kwargs = {
+        "rel_feedback_doc": rel_feedback_doc,
+        "dubbed_video_path": dubbed_video_path,
+        "output_dir": output_dir,
+        "clip_duration": clip_duration,
+        "speaker_verification_targets": speaker_verification_targets,
+        "include_unverified_subtitles": include_unverified_subtitles,
+        "alignment_data": alignment,
+    }
+    if subtitle_style_overrides:
+        kwargs["subtitle_style_overrides"] = subtitle_style_overrides
+    return _fallback_generate_subtitles_and_mp4(**kwargs)
 
 
 def _snapshot_input_files(paths):
@@ -2905,11 +3230,18 @@ def run_phase11_dubbing_pipeline(
     allow_preset_fallback=True,
     preset_speaker_map=None,
     default_preset_voice=None,
+    speaker_age_map=None,
+    speaker_atmosphere_map=None,
+    auto_select_preset=False,
+    prosody_style="auto",
     merge_split_utterances=False,
     explicit_merge_groups=None,
     max_merge_gap_seconds=1.5,
     null_speaker_policy="hold_for_verification",
     explicit_speaker_assignments=None,
+    speaker_decisions_path=None,
+    editorial_plan_path=None,
+    revised_script_out_path=None,
     include_unverified_subtitles=False,
     preset_model=DEFAULT_PRESET_MODEL,
     clone_model=DEFAULT_BASE_MODEL,
@@ -2921,14 +3253,33 @@ def run_phase11_dubbing_pipeline(
     max_timing_shift=0.5,
     max_inter_speaker_shift=0.0,
     auto_tempo_adjust=False,
+    min_atempo=0.90,
     max_atempo=1.25,
+    fit_utterance_slots=False,
+    mix_mode="voiceover",
+    duck_gain=0.12,
+    unspoken_gain=1.0,
+    tts_gain=1.0,
+    duck_fade_out_seconds=0.18,
+    duck_fade_in_seconds=0.25,
+    ambient_backend="auto",
+    ambient_gain=0.85,
+    subtitle_font_scale=1.25,
+    subtitle_font_size=None,
+    subtitle_margin_v=None,
+    subtitle_outline=None,
+    subtitle_shadow=None,
+    subtitle_background_box=True,
+    subtitle_box_opacity=0.60,
+    subtitle_strip_periods=True,
+    subtitle_comma_mode="halfwidth_space",
     allow_diagnostic_on_collision=False,
     reuse_wav_dir=None,
     existing_feedback_path=None,
     alignment_json_path=None,
     source_utterances_path=None,
 ):
-    """Execute the end-to-end Japanese dubbing pipeline (supporting both Phase 11 and Phase 12 workflows)."""
+    """Execute the end-to-end Japanese dubbing pipeline (supporting Phase 11, Phase 12, and Phase 13 workflows)."""
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     if any(root.iterdir()):
@@ -2937,7 +3288,7 @@ def run_phase11_dubbing_pipeline(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # Guard against overwriting input directories
-    for in_p in (script_path, video_path, voice_profiles_path, reference_audio, reuse_wav_dir):
+    for in_p in (script_path, video_path, voice_profiles_path, reference_audio, reuse_wav_dir, speaker_decisions_path, editorial_plan_path):
         if in_p and Path(in_p).exists():
             in_resolved = Path(in_p).resolve()
             if in_resolved == root or (in_resolved.is_file() and in_resolved.parent == root):
@@ -2957,6 +3308,8 @@ def run_phase11_dubbing_pipeline(
         existing_feedback_path,
         source_utterances_path,
         alignment_json_path,
+        speaker_decisions_path,
+        editorial_plan_path,
     ]
     if speaker_ref_map:
         tracked_inputs.extend(speaker_ref_map.values())
@@ -3017,7 +3370,7 @@ def run_phase11_dubbing_pipeline(
         )
         voice_profiles = load_profiles(reg_path)
     elif reference_audio is not None:
-        # Phase 12 decoupled TechnicalVoiceReference (no redundant consent.json / review.json ceremony!)
+        # Phase 12/13 decoupled TechnicalVoiceReference (no redundant consent.json / review.json ceremony!)
         ref_txt_val = None
         if reference_text is not None:
             ref_txt_val = (
@@ -3077,6 +3430,22 @@ def run_phase11_dubbing_pipeline(
             raise FileNotFoundError(f"Input dubbing script not found: {script_file}")
 
     raw_script_doc = json.loads(script_file.read_text(encoding="utf-8"))
+
+    # Optional Phase 12/13 editorial plan + bound speaker decisions application
+    if editorial_plan_path and Path(editorial_plan_path).is_file():
+        from dubbing_quality import apply_editorial_plan
+        plan_doc = json.loads(Path(editorial_plan_path).read_text(encoding="utf-8"))
+        decisions_doc = (
+            json.loads(Path(speaker_decisions_path).read_text(encoding="utf-8"))
+            if speaker_decisions_path and Path(speaker_decisions_path).is_file()
+            else None
+        )
+        raw_script_doc = apply_editorial_plan(raw_script_doc, plan_doc, speaker_decisions=decisions_doc)
+        if revised_script_out_path:
+            rev_out = Path(revised_script_out_path).resolve()
+            if rev_out != script_file:
+                _atomic_write_json(rev_out, raw_script_doc)
+
     norm_script = normalize_script_utterances(
         raw_script_doc,
         script_path=script_file,
@@ -3095,12 +3464,15 @@ def run_phase11_dubbing_pipeline(
     )
 
     # Human CLI assignments must be applied before merging, while unknowns remain barriers.
-    initial_partition = partition_and_manage_null_speakers(norm_script["utterances"],
-        explicit_speaker_assignments=explicit_speaker_assignments, null_speaker_policy=null_speaker_policy)
-    assigned_by_id = {r["id"]:r for r in initial_partition["assigned_utterances"]}
-    merge_inputs = [assigned_by_id.get(r["id"],r) for r in norm_script["utterances"]]
+    initial_partition = partition_and_manage_null_speakers(
+        norm_script["utterances"],
+        explicit_speaker_assignments=explicit_speaker_assignments,
+        null_speaker_policy=null_speaker_policy,
+    )
+    assigned_by_id = {r["id"]: r for r in initial_partition["assigned_utterances"]}
+    merge_inputs = [assigned_by_id.get(r["id"], r) for r in norm_script["utterances"]]
 
-    # 3. Step 3a: Detect & merge split continuous utterances (such as IDs 64–66)
+    # 3. Step 3a: Detect & merge split continuous utterances
     # Note: `speaker: null` / UNKNOWN utterances are preserved as barriers and never merged!
     already_revised = bool(isinstance(raw_script_doc, dict) and raw_script_doc.get("quality_revision"))
     merge_result = detect_and_merge_split_utterances(
@@ -3212,15 +3584,54 @@ def run_phase11_dubbing_pipeline(
         preset_speaker_map=preset_map,
         default_preset_voice=default_preset_voice,
         allow_preset_fallback=allow_preset_fallback,
+        speaker_age_map=speaker_age_map,
+        speaker_atmosphere_map=speaker_atmosphere_map,
+        auto_select_preset=auto_select_preset,
     )
+
+    # Optimize TTS prosody parameters if prosody_style is explicitly configured
+    effective_temp = float(temperature)
+    effective_top_k = int(top_k)
+    effective_top_p = float(top_p)
+    effective_rep_pen = float(repetition_penalty)
+    prosody_tuning_info = None
+    if prosody_style and str(prosody_style).lower() not in ("default", "none", "auto"):
+        from voice_quality import optimize_tts_prosody_settings
+        prosody_tuning_info = optimize_tts_prosody_settings(
+            prosody_style=prosody_style,
+            base_temperature=effective_temp,
+            base_top_k=effective_top_k,
+            base_top_p=effective_top_p,
+            base_repetition_penalty=effective_rep_pen,
+        )
+        effective_temp = float(prosody_tuning_info["temperature"])
+        effective_top_k = int(prosody_tuning_info["top_k"])
+        effective_top_p = float(prosody_tuning_info["top_p"])
+        effective_rep_pen = float(prosody_tuning_info["repetition_penalty"])
 
     # 7. Run X-vector TTS synthesis & feedback measurement
     tts_dir = work_dir / "tts_feedback"
-    did_modify_script = bool(merge_result["merged_groups"] or speaker_verification_targets or explicit_assignments_applied)
+    did_modify_script = bool(
+        merge_result["merged_groups"]
+        or speaker_verification_targets
+        or explicit_assignments_applied
+        or already_revised
+    )
 
     if existing_feedback_path and Path(existing_feedback_path).is_file():
         fb_path = Path(existing_feedback_path).resolve()
         feedback_doc = json.loads(fb_path.read_text(encoding="utf-8"))
+        for _fb_row in feedback_doc.get("entries", []):
+            _af = _fb_row.get("audio_file")
+            if _af:
+                try:
+                    _af_ok = Path(_af).is_file()
+                except OSError:
+                    _af_ok = False
+                if not _af_ok:
+                    _alt_af = fb_path.parent / "audio" / Path(_af).name
+                    if _alt_af.is_file():
+                        _fb_row["audio_file"] = str(_alt_af.resolve())
     else:
         from tts_generator import QwenPresetSynthesizer
 
@@ -3234,10 +3645,10 @@ def run_phase11_dubbing_pipeline(
                 clone_model,
                 clone_method=voice_plan["effective_clone_method"],
                 seed=seed,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
+                temperature=effective_temp,
+                top_k=effective_top_k,
+                top_p=effective_top_p,
+                repetition_penalty=effective_rep_pen,
             )
             if voice_plan["uses_clone"]
             else None
@@ -3252,8 +3663,8 @@ def run_phase11_dubbing_pipeline(
         else:
             active_backend = preset_backend
 
-        # Use decoupled technical feedback runner when TechnicalVoiceReferences, merged utterances, or reuse_wav_dir are active
-        if voice_plan.get("uses_technical_reference") or did_modify_script or reuse_wav_dir:
+        # Use decoupled technical feedback runner when TechnicalVoiceReferences, merged utterances, auto preset selection, or reuse_wav_dir are active
+        if voice_plan.get("uses_technical_reference") or did_modify_script or reuse_wav_dir or auto_select_preset:
             fb_path, feedback_doc = run_technical_xvector_feedback(
                 utterances=active_utterances,
                 selection_range={"start": selection_start, "end": selection_end},
@@ -3271,11 +3682,22 @@ def run_phase11_dubbing_pipeline(
             }
             if voice_plan["voice_profiles"] is not None:
                 fb_kwargs["voice_profiles"] = voice_plan["voice_profiles"]
-            fb_res = run_feedback(script_file, tts_dir, **fb_kwargs)
-            fb_path = _extract_path_from_result(fb_res, tts_dir / "feedback.json")
-            feedback_doc = json.loads(fb_path.read_text(encoding="utf-8"))
+            try:
+                fb_res = run_feedback(script_file, tts_dir, **fb_kwargs)
+                fb_path = _extract_path_from_result(fb_res, tts_dir / "feedback.json")
+                feedback_doc = json.loads(fb_path.read_text(encoding="utf-8"))
+            except ValueError:
+                fb_path, feedback_doc = run_technical_xvector_feedback(
+                    utterances=active_utterances,
+                    selection_range={"start": selection_start, "end": selection_end},
+                    output_dir=tts_dir,
+                    backend=active_backend,
+                    voice_plan=voice_plan,
+                    reuse_wav_dir=reuse_wav_dir,
+                )
 
     # 8. Measure actual Japanese audio durations and adjust overflows / collisions / inter-speaker overlaps
+    source_rows = json.loads(Path(source_utterances_path).read_text())["utterances"] if source_utterances_path else None
     adjusted_wav_dir = work_dir / "adjusted_wavs"
     timeline_analysis = analyze_timeline_collisions_and_overlaps(
         feedback_doc.get("entries", []),
@@ -3284,8 +3706,11 @@ def run_phase11_dubbing_pipeline(
         max_timing_shift=max_timing_shift,
         max_inter_speaker_shift=max_inter_speaker_shift,
         auto_tempo_adjust=auto_tempo_adjust,
+        min_atempo=min_atempo,
         max_atempo=max_atempo,
+        fit_utterance_slots=fit_utterance_slots,
         adjusted_wav_dir=adjusted_wav_dir,
+        source_utterances=source_rows or norm_script["utterances"],
     )
     unresolved = timeline_analysis["unresolved_same_speaker_collisions"]
     if unresolved and not allow_diagnostic_on_collision:
@@ -3295,13 +3720,14 @@ def run_phase11_dubbing_pipeline(
             f"Shorten the Japanese script or pass --allow-diagnostic-on-collision to render a diagnostic MP4."
         )
 
-    # 9. Mix 48kHz audio tracks & mux with preserved video stream
-    mixer_mode = "diagnostic" if unresolved else "normal"
+    # 9. Mix 48kHz audio tracks (with Phase 13 voiceover ducking / ambient preservation) & mux with preserved video stream
+    effective_mix_mode = mix_mode if mix_mode else ("diagnostic" if unresolved else "voiceover")
     mix_dir = work_dir / "audio_mixer"
     prefer_internal = bool(
         did_modify_script
         or voice_plan.get("uses_technical_reference")
         or timeline_analysis.get("duration_adjustments")
+        or effective_mix_mode in ("voiceover", "ducking", "ambient", "separated-ambient", "hybrid-ambient")
     )
     mix_report_path, mix_report = _invoke_audio_mixer(
         script_path=working_script_path if did_modify_script else script_file,
@@ -3312,7 +3738,14 @@ def run_phase11_dubbing_pipeline(
         placements_map=timeline_analysis["placements"],
         selection_start=selection_start,
         clip_duration=clip_duration,
-        mode=mixer_mode,
+        mode=effective_mix_mode,
+        duck_gain=duck_gain,
+        unspoken_gain=unspoken_gain,
+        tts_gain=tts_gain,
+        fade_out_seconds=duck_fade_out_seconds,
+        fade_in_seconds=duck_fade_in_seconds,
+        ambient_backend=ambient_backend,
+        ambient_gain=ambient_gain,
         max_timing_shift=max_timing_shift,
         prefer_internal_mixer=prefer_internal,
     )
@@ -3352,6 +3785,19 @@ def run_phase11_dubbing_pipeline(
     rel_feedback_path = work_dir / "feedback_clip_relative.json"
     _atomic_write_json(rel_feedback_path, rel_feedback_doc)
 
+    sub_style_overrides = {
+        "font_scale": subtitle_font_scale,
+        "font_size": subtitle_font_size,
+        "margin_v": subtitle_margin_v,
+        "outline": subtitle_outline,
+        "shadow": subtitle_shadow,
+        "background_box": subtitle_background_box,
+        "box_opacity": subtitle_box_opacity,
+        "strip_periods": subtitle_strip_periods,
+        "comma_mode": subtitle_comma_mode,
+    }
+    sub_style_overrides = {k: v for k, v in sub_style_overrides.items() if v is not None}
+
     sub_dir = work_dir / "subtitles"
     sub_report_path, sub_report = _invoke_japanese_subtitles(
         rel_feedback_path=rel_feedback_path,
@@ -3363,6 +3809,7 @@ def run_phase11_dubbing_pipeline(
         alignment_json_path=alignment_json_path,
         speaker_verification_targets=speaker_verification_targets,
         include_unverified_subtitles=include_unverified_subtitles,
+        subtitle_style_overrides=sub_style_overrides,
     )
 
     # Publish final deliverables to root output_dir
@@ -3383,18 +3830,38 @@ def run_phase11_dubbing_pipeline(
     first_srt_start = _parse_first_srt_start_seconds(final_srt)
     integrity_verification = _verify_input_files_unchanged(input_snapshot_before)
 
-    from dubbing_quality import completion_assessment
-    source_rows = json.loads(Path(source_utterances_path).read_text())["utterances"] if source_utterances_path else None
-    completion = completion_assessment(utterances_after_merge, feedback_doc.get("entries",[]),
-        selection={"start":selection_start,"end":selection_end}, source_rows=source_rows,
-        excluded=raw_script_doc.get("excluded",[]), speaker_targets=speaker_verification_targets,
-        subtitle_report=sub_report,timeline=timeline_analysis,
-        media_ok=bool(media_probe.get("has_video") and media_probe.get("has_audio")))
+    from voice_quality import evaluate_dubbing_voice_and_naturalness
+    all_refs = {**voice_profiles, **technical_references}
+    voice_evaluation = evaluate_dubbing_voice_and_naturalness(
+        rel_feedback_doc.get("entries", []),
+        speaker_references=all_refs,
+    )
+
+    from dubbing_quality import completion_assessment, detect_quality_anomalies
+    completion = completion_assessment(
+        utterances_after_merge,
+        feedback_doc.get("entries", []),
+        selection={"start": selection_start, "end": selection_end},
+        source_rows=source_rows,
+        excluded=raw_script_doc.get("excluded", []),
+        speaker_targets=speaker_verification_targets,
+        subtitle_report=sub_report,
+        timeline=timeline_analysis,
+        media_ok=bool(media_probe.get("has_video") and media_probe.get("has_audio")),
+    )
+    quality_anomalies = detect_quality_anomalies(
+        timing_diagnostics=timeline_analysis.get("timing_sync_diagnostics"),
+        subtitle_report=sub_report,
+        mix_report=mix_report,
+        voice_evaluation=voice_evaluation,
+    )
+
     pipeline_report = {
         "kind": "transclip_phase12_dubbing_report",
-        "format_version": 2,
+        "format_version": 3,
         "status": completion["status"],
         "completion": completion,
+        "quality_anomalies": quality_anomalies,
         "selection_range": {
             "source_start_seconds": selection_start,
             "source_end_seconds": selection_end,
@@ -3407,7 +3874,18 @@ def run_phase11_dubbing_pipeline(
             "preset_auto_fallback_disabled": not allow_preset_fallback or voice_mode == "xvector",
             "authentication_bypass_used": False,
         },
+        "audio_mixing_and_ducking": {
+            "mix_mode": mix_report.get("mix_mode", effective_mix_mode),
+            "duck_gain": mix_report.get("duck_gain", duck_gain),
+            "unspoken_gain": mix_report.get("unspoken_gain", unspoken_gain),
+            "tts_gain": mix_report.get("tts_gain", tts_gain),
+            "ducking_envelope": mix_report.get("ducking_envelope"),
+            "ambient_separation": mix_report.get("ambient_separation"),
+            "loudness_verification": mix_report.get("loudness_verification"),
+        },
         "voice_routing": {k: v for k, v in voice_plan.items() if k != "voice_profiles"},
+        "prosody_tuning": prosody_tuning_info,
+        "voice_and_naturalness_evaluation": voice_evaluation,
         "rights_and_governance": voice_plan.get("rights_and_governance", []),
         "utterance_merging": {
             "enabled": bool(merge_split_utterances or explicit_merge_groups),
@@ -3426,6 +3904,12 @@ def run_phase11_dubbing_pipeline(
             "targets": speaker_verification_targets,
         },
         "collision_and_overlap_analysis": timeline_analysis,
+        "subtitle_ui_summary": {
+            "style": sub_report.get("style"),
+            "cue_count": sub_report.get("cue_count"),
+            "overflow_check": sub_report.get("overflow_check"),
+            "subtitle_render_mode": sub_report.get("subtitle_render_mode"),
+        },
         "input_integrity_verification": integrity_verification,
         "deliverables": {
             "final_ja_mp4": str(final_mp4),
@@ -3491,6 +3975,48 @@ def run_phase12_dubbing_pipeline(
     )
 
 
+def run_phase13_dubbing_pipeline(
+    *,
+    video_path,
+    script_path,
+    output_dir,
+    **kwargs,
+):
+    """Execute Phase 13 Generic Japanese Dubbing Pipeline with voice-over ducking,
+    0.9-1.3x speech timing synchronization, ambient preservation, and high-visibility subtitles.
+    """
+    defaults = {
+        "voice_mode": "xvector",
+        "clone_method": "xvector",
+        "allow_preset_fallback": False,
+        "extract_reference_from_video": True,
+        "rights_mode": "permitted_local",
+        "merge_split_utterances": True,
+        "null_speaker_policy": "hold_for_verification",
+        "max_timing_shift": 1.2,
+        "max_inter_speaker_shift": 0.6,
+        "auto_tempo_adjust": True,
+        "min_atempo": 0.90,
+        "max_atempo": 1.30,
+        "fit_utterance_slots": True,
+        "mix_mode": "voiceover",
+        "duck_gain": 0.12,
+        "unspoken_gain": 1.0,
+        "subtitle_font_scale": 1.25,
+        "subtitle_background_box": True,
+        "subtitle_strip_periods": True,
+        "subtitle_comma_mode": "halfwidth_space",
+        "allow_diagnostic_on_collision": True,
+    }
+    defaults.update(kwargs)
+    return run_phase11_dubbing_pipeline(
+        script_path=script_path,
+        video_path=video_path,
+        output_dir=output_dir,
+        **defaults,
+    )
+
+
 def _format_pipeline_report_md(report):
     deliv = report["deliverables"]
     vr = report["voice_routing"]
@@ -3500,16 +4026,19 @@ def _format_pipeline_report_md(report):
     um = report.get("utterance_merging") or {}
     svm = report.get("speaker_verification_management") or {}
     integ = report.get("input_integrity_verification") or {}
+    amd = report.get("audio_mixing_and_ducking") or {}
+    sub_ui = report.get("subtitle_ui_summary") or {}
 
     lines = [
-        "# TransClip Phase 12 — X-vector日本語吹き替えMP4 パイプライン検証レポート",
+        "# TransClip Phase 12 / Phase 13 — 日本語吹き替えMP4 パイプライン検証レポート",
         "",
         f"- **ステータス**: `{report['status']}`",
         f"- **網羅性・品質確認**: `{json.dumps(report.get('completion',{}),ensure_ascii=False)}`",
+        f"- **音声ミキシング方式**: `{amd.get('mix_mode')}` (duck_gain=`{amd.get('duck_gain')}`, unspoken_gain=`{amd.get('unspoken_gain')}`)",
         f"- **クリップ時間範囲**: 元動画 `{sel['source_start_seconds']:.2f}s .. {sel['source_end_seconds']:.2f}s` → クリップ相対時刻 `0.00s .. {sel['clip_duration_seconds']:.2f}s`",
         f"- **出力MP4（字幕あり）**: `{deliv['final_ja_mp4']}` ({mv['duration_seconds']:.2f}s, {mv['video_codec']} {mv['width']}x{mv['height']}, {mv['audio_codec']} {mv['audio_sample_rate']}Hz {mv['audio_channels']}ch)",
         f"- **出力MP4（字幕なし）**: `{deliv['final_ja_no_subtitles_mp4']}`",
-        f"- **出力日本語字幕**: `{deliv['final_ja_srt']}` / `{deliv['final_ja_ass']}`",
+        f"- **出力日本語字幕**: `{deliv['final_ja_srt']}` / `{deliv['final_ja_ass']}` (cues={sub_ui.get('cue_count')})",
         f"- **出力吹き替え音声WAV**: `{deliv['dubbed_audio_wav']}`",
         f"- **入力ファイル非破壊検証 (SHA-256)**: `verified={integ.get('verified')}` ({integ.get('checked_file_count', 0)} files checked)",
         "",
@@ -3527,7 +4056,7 @@ def _format_pipeline_report_md(report):
 
     lines += [
         "",
-        "## 2. 不自然に分割された一続きの発話の検出・統合（発話ID 64〜66 等）",
+        "## 2. 不自然に分割された一続きの発話の検出・統合",
         "",
         f"- **統合グループ数**: {um.get('merged_group_count', 0)}組（統合前 {um.get('utterance_count_before_merge', 0)}件 → 統合後 {um.get('utterance_count_after_merge', 0)}件）",
     ]
@@ -3565,11 +4094,11 @@ def _format_pipeline_report_md(report):
 
     lines += [
         "",
-        "## 4. 日本語音声の実測長・時間超過・話者間重複の調整",
+        "## 4. 日本語音声の実測長・タイミング同期・話者間重複の調整",
         "",
         f"- **初期同一話者衝突数**: {len(col['initial_same_speaker_collisions'])}件",
         f"- **タイミングシフトによる解消数**: {len(col['resolved_same_speaker_collisions'])}件",
-        f"- **非破壊長調整（無音トリム / 上限付きatempo）件数**: {len(col.get('duration_adjustments', []))}件",
+        f"- **非破壊長調整（無音トリム / 0.9〜1.3倍atempo）件数**: {len(col.get('duration_adjustments', []))}件",
         f"- **話者間の人工的TTS超過スピル調整数**: {len(col.get('adjusted_inter_speaker_overlaps', []))}件",
         f"- **保持した別話者の自然な重なり**: {len(col['preserved_other_speaker_overlaps'])}件",
         f"- **解決不能な同一話者衝突数**: {len(col['unresolved_same_speaker_collisions'])}件",
@@ -3603,8 +4132,9 @@ def _format_pipeline_report_md(report):
     return "\n".join(lines)
 
 
-def _add_common_cli_arguments(p, *, is_phase12=False):
-    p.add_argument("--source-utterances", type=Path, help="Full source utterances for coverage and boundary checks")
+def _add_common_cli_arguments(p, *, is_phase12=False, is_phase13=False):
+    is_modern = bool(is_phase12 or is_phase13)
+    p.add_argument("--source-utterances", "--source-transcript-json", dest="source_utterances", type=Path, help="Full source utterances for coverage and boundary checks")
     p.add_argument(
         "--script",
         "--dubbing-script",
@@ -3615,6 +4145,7 @@ def _add_common_cli_arguments(p, *, is_phase12=False):
     p.add_argument(
         "--video",
         "--source-video",
+        "--source-media",
         dest="video",
         default=DEFAULT_PHASE12_VIDEO if is_phase12 else None,
         help="Path to source video clip MP4",
@@ -3643,7 +4174,7 @@ def _add_common_cli_arguments(p, *, is_phase12=False):
         "--extract-reference-from-video",
         dest="extract_reference_from_video",
         action="store_true",
-        default=True if is_phase12 else False,
+        default=True if is_modern else False,
         help="Extract clean non-overlapping reference speech per speaker from --video for X-vector conditioning",
     )
     p.add_argument(
@@ -3673,14 +4204,14 @@ def _add_common_cli_arguments(p, *, is_phase12=False):
     p.add_argument(
         "--voice-mode",
         choices=("xvector", "auto", "icl", "preset"),
-        default="xvector" if is_phase12 else "auto",
+        default="xvector" if is_modern else "auto",
     )
     p.add_argument("--clone-method", choices=("xvector", "icl"), default="xvector")
     p.add_argument(
         "--no-preset-fallback",
         dest="allow_preset_fallback",
         action="store_false",
-        default=False if is_phase12 else True,
+        default=False if is_modern else True,
         help="Never silently fall back to Preset when X-vector reference/synthesis fails",
     )
     p.add_argument(
@@ -3691,11 +4222,35 @@ def _add_common_cli_arguments(p, *, is_phase12=False):
     )
     p.add_argument("--default-preset-voice", default=None, help="Preset voice when --voice-mode preset is explicitly selected")
     p.add_argument(
+        "--speaker-age",
+        action="append",
+        default=[],
+        help="Speaker age hint for preset voice selection: SPEAKER_ID={young,adult,mature} (repeatable)",
+    )
+    p.add_argument(
+        "--speaker-atmosphere",
+        action="append",
+        default=[],
+        help="Speaker atmosphere/tone hint for preset selection: SPEAKER_ID={calm,energetic,authoritative,warm,conversational,lecture,narrative,friendly} (repeatable)",
+    )
+    p.add_argument(
+        "--auto-select-preset",
+        action="store_true",
+        default=False,
+        help="Automatically select the best preset voice per speaker based on F0, age, and atmosphere",
+    )
+    p.add_argument(
+        "--prosody-style",
+        choices=("auto", "natural", "conversational", "calm", "lecture", "expressive"),
+        default="auto",
+        help="Prosody sampling style preset for Japanese TTS naturalness",
+    )
+    p.add_argument(
         "--merge-split-utterances",
         dest="merge_split_utterances",
         action="store_true",
-        default=True if is_phase12 else False,
-        help="Detect and merge unnaturally split continuous same-speaker sentences (such as IDs 64-66)",
+        default=True if is_modern else False,
+        help="Detect and merge unnaturally split continuous same-speaker sentences",
     )
     p.add_argument(
         "--no-merge-split-utterances",
@@ -3722,6 +4277,9 @@ def _add_common_cli_arguments(p, *, is_phase12=False):
         default=[],
         help="Explicit human speaker verification assignment: UTT_ID=SPEAKER_ID (repeatable)",
     )
+    p.add_argument("--speaker-decisions", "--speaker-decisions-json", dest="speaker_decisions", default=None, help="Path to bound speaker_decisions.json")
+    p.add_argument("--editorial-plan", "--editorial-plan-json", dest="editorial_plan", default=None, help="Path to editorial_plan.json")
+    p.add_argument("--revised-script-out", default=None, help="Optional output path to save revised dubbing script JSON")
     p.add_argument(
         "--include-unverified-subtitles",
         action="store_true",
@@ -3734,14 +4292,14 @@ def _add_common_cli_arguments(p, *, is_phase12=False):
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--repetition-penalty", type=float, default=1.05)
-    p.add_argument("--max-timing-shift", type=float, default=1.2 if is_phase12 else 0.5)
-    p.add_argument("--max-inter-speaker-shift", type=float, default=0.6 if is_phase12 else 0.0)
+    p.add_argument("--max-timing-shift", type=float, default=1.2 if is_modern else 0.5)
+    p.add_argument("--max-inter-speaker-shift", type=float, default=0.6 if is_modern else 0.0)
     p.add_argument(
         "--auto-tempo-adjust",
         dest="auto_tempo_adjust",
         action="store_true",
-        default=True if is_phase12 else False,
-        help="Trim silence and apply bounded non-destructive atempo when Japanese audio overflows slot/collides",
+        default=True if is_modern else False,
+        help="Trim silence and apply bounded non-destructive atempo (0.9..1.3x) to synchronize speech timing",
     )
     p.add_argument(
         "--no-auto-tempo-adjust",
@@ -3749,16 +4307,66 @@ def _add_common_cli_arguments(p, *, is_phase12=False):
         action="store_false",
         help="Disable automatic non-destructive tempo adjustment",
     )
-    p.add_argument("--max-atempo", type=float, default=1.25, help="Max bounded atempo ratio (default: 1.25)")
+    p.add_argument("--min-atempo", type=float, default=0.90, help="Min bounded atempo ratio for slot fitting (default: 0.90)")
+    p.add_argument("--max-atempo", type=float, default=1.30 if is_phase13 else 1.25, help="Max bounded atempo ratio (default: 1.30)")
+    p.add_argument(
+        "--fit-utterance-slots",
+        dest="fit_utterance_slots",
+        action="store_true",
+        default=True if is_phase13 else False,
+        help="Automatically adjust TTS speaking rate within [min_atempo, max_atempo] to match speaker utterance slots",
+    )
+    p.add_argument(
+        "--no-fit-utterance-slots",
+        dest="fit_utterance_slots",
+        action="store_false",
+        help="Only adjust tempo when overflowing a downstream barrier",
+    )
+    # Phase 13 Audio Ducking & Ambient Preservation CLI options
+    p.add_argument(
+        "--mix-mode",
+        choices=("voiceover", "ducking", "ambient", "hybrid-ambient", "japanese-only", "full-dub", "reference-mix"),
+        default="voiceover",
+        help="Audio mixing mode: 'voiceover'/'ducking' (10-15%% original audio during TTS), 'ambient' (separated room tone), or 'japanese-only' (full replacement)",
+    )
+    p.add_argument("--duck-gain", type=float, default=0.12, help="Original audio volume ratio during Japanese TTS speech (default: 0.12 = 12%%)")
+    p.add_argument("--unspoken-gain", type=float, default=1.0, help="Original audio volume ratio during non-TTS intervals (default: 1.0)")
+    p.add_argument("--tts-gain", type=float, default=1.0, help="Japanese TTS foreground volume multiplier (default: 1.0)")
+    p.add_argument("--duck-fade-out", type=float, default=0.18, help="Smooth ducking attack/fade-out seconds before TTS starts (default: 0.18)")
+    p.add_argument("--duck-fade-in", type=float, default=0.25, help="Smooth ducking release/fade-in seconds after TTS ends (default: 0.25)")
+    p.add_argument(
+        "--ambient-backend",
+        choices=("auto", "dsp", "demucs", "torchscript", "convtasnet", "none"),
+        default="auto",
+        help="Source separation backend for ambient sound preservation (default: 'auto')",
+    )
+    p.add_argument("--ambient-gain", type=float, default=0.85, help="Separated ambient bed gain in 'ambient'/'hybrid-ambient' modes (default: 0.85)")
+    # Phase 13 Subtitle UI CLI options
+    p.add_argument("--subtitle-font-scale", type=float, default=1.25, help="Subtitle font scale factor vs conventional size (default: 1.25)")
+    p.add_argument("--subtitle-font-size", type=int, default=None, help="Explicit subtitle font size override")
+    p.add_argument("--subtitle-margin-v", type=int, default=None, help="Explicit subtitle bottom vertical margin override")
+    p.add_argument("--subtitle-outline", type=float, default=None, help="Explicit subtitle outline thickness override")
+    p.add_argument("--subtitle-shadow", type=float, default=None, help="Explicit subtitle drop shadow override")
+    p.add_argument("--subtitle-box", dest="subtitle_background_box", action="store_true", default=True, help="Enable semi-transparent black background box (座布団)")
+    p.add_argument("--no-subtitle-box", dest="subtitle_background_box", action="store_false", help="Disable subtitle background box")
+    p.add_argument("--subtitle-box-opacity", type=float, default=0.60, help="Subtitle background box opacity 0.0..1.0 (default: 0.60)")
+    p.add_argument("--subtitle-strip-periods", dest="subtitle_strip_periods", action="store_true", default=True, help="Omit Japanese periods '。' in rendered subtitles")
+    p.add_argument("--no-subtitle-strip-periods", dest="subtitle_strip_periods", action="store_false", help="Retain Japanese periods '。' in rendered subtitles")
+    p.add_argument(
+        "--subtitle-comma-mode",
+        choices=("halfwidth_space", "minimal", "keep"),
+        default="halfwidth_space",
+        help="How to format Japanese commas '、' in rendered subtitles (default: 'halfwidth_space')",
+    )
     p.add_argument(
         "--allow-diagnostic-on-collision",
         action="store_true",
-        default=True if is_phase12 else False,
+        default=True if is_modern else False,
         help="Continue rendering MP4 and report unresolved collision budgets if severe collisions remain",
     )
     p.add_argument("--reuse-wav-dir", default=None, help="Optional directory of existing synthesized WAVs to reuse non-destructively")
     p.add_argument("--existing-feedback", default=None, help="Optional existing feedback.json to reuse")
-    p.add_argument("--alignment-json", default=None, help="Optional ASR alignment JSON for subtitle verification")
+    p.add_argument("--alignment-json", "--asr-word-timestamps-json", dest="alignment_json", default=None, help="Optional ASR alignment JSON for subtitle verification")
     p.add_argument(
         "--output",
         "--output-dir",
@@ -3773,29 +4381,37 @@ def main(argv=None):
         raw_argv = ["run-phase12"] + raw_argv
 
     parser = argparse.ArgumentParser(
-        description="TransClip Phase 11 & Phase 12 — X-vector Japanese Dubbing MP4 Pipeline"
+        description="TransClip Phase 11–13 — Universal X-vector Japanese Dubbing MP4 Pipeline"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_p13 = sub.add_parser(
+        "run-phase13",
+        help="Run Phase 13 universal Japanese dubbing pipeline with voiceover ducking, 0.9-1.3x timing sync, ambient preservation, and enhanced subtitle UI",
+    )
+    _add_common_cli_arguments(p_p13, is_phase12=False, is_phase13=True)
+
     p_p12 = sub.add_parser(
         "run-phase12",
-        help="Run Phase 12 X-vector real-video dubbing pipeline (defaults to output/phase11_1885_1915/source.mp4 & dubbing_script.json)",
+        help="Run Phase 12 X-vector real-video dubbing pipeline",
     )
-    _add_common_cli_arguments(p_p12, is_phase12=True)
+    _add_common_cli_arguments(p_p12, is_phase12=True, is_phase13=False)
 
     for sub_name, help_text in [
         ("run-synth-30s", "Run 30-second E2E verification dubbing pipeline on approved synthetic speaker SYNTH_EN_01"),
-        ("run", "Run 30-second E2E dubbing pipeline on a dubbing_script.json and video clip"),
+        ("run", "Run E2E dubbing pipeline on any dubbing_script.json and video clip"),
     ]:
         p = sub.add_parser(sub_name, help=help_text)
-        _add_common_cli_arguments(p, is_phase12=False)
+        _add_common_cli_arguments(p, is_phase12=False, is_phase13=False)
 
     args = parser.parse_args(raw_argv)
     preset_map = parse_preset_speaker_mappings(args.preset_speaker)
     speaker_ref_map = parse_key_value_mappings(args.speaker_ref, flag_name="--speaker-ref")
     speaker_source_types = parse_key_value_mappings(args.speaker_source_type, flag_name="--speaker-source-type")
     explicit_assignments = parse_key_value_mappings(args.assign_speaker, flag_name="--assign-speaker")
-    default_preset = args.default_preset_voice or ("Ryan" if args.voice_mode == "preset" else None)
+    speaker_age_map = parse_key_value_mappings(args.speaker_age, flag_name="--speaker-age")
+    speaker_atmosphere_map = parse_key_value_mappings(args.speaker_atmosphere, flag_name="--speaker-atmosphere")
+    default_preset = args.default_preset_voice or ("Ryan" if (args.voice_mode == "preset" and not args.auto_select_preset and not speaker_age_map and not speaker_atmosphere_map) else None)
 
     report_path, report = run_phase11_dubbing_pipeline(
         script_path=args.script,
@@ -3819,11 +4435,18 @@ def main(argv=None):
         allow_preset_fallback=args.allow_preset_fallback,
         preset_speaker_map=preset_map,
         default_preset_voice=default_preset,
+        speaker_age_map=speaker_age_map,
+        speaker_atmosphere_map=speaker_atmosphere_map,
+        auto_select_preset=args.auto_select_preset,
+        prosody_style=args.prosody_style,
         merge_split_utterances=args.merge_split_utterances,
         explicit_merge_groups=args.merge_ids,
         max_merge_gap_seconds=args.max_merge_gap,
         null_speaker_policy=args.null_speaker_policy,
         explicit_speaker_assignments=explicit_assignments,
+        speaker_decisions_path=args.speaker_decisions,
+        editorial_plan_path=args.editorial_plan,
+        revised_script_out_path=args.revised_script_out,
         include_unverified_subtitles=args.include_unverified_subtitles,
         preset_model=args.preset_model,
         clone_model=args.clone_model,
@@ -3835,7 +4458,26 @@ def main(argv=None):
         max_timing_shift=args.max_timing_shift,
         max_inter_speaker_shift=args.max_inter_speaker_shift,
         auto_tempo_adjust=args.auto_tempo_adjust,
+        min_atempo=args.min_atempo,
         max_atempo=args.max_atempo,
+        fit_utterance_slots=args.fit_utterance_slots,
+        mix_mode=args.mix_mode,
+        duck_gain=args.duck_gain,
+        unspoken_gain=args.unspoken_gain,
+        tts_gain=args.tts_gain,
+        duck_fade_out_seconds=args.duck_fade_out,
+        duck_fade_in_seconds=args.duck_fade_in,
+        ambient_backend=args.ambient_backend,
+        ambient_gain=args.ambient_gain,
+        subtitle_font_scale=args.subtitle_font_scale,
+        subtitle_font_size=args.subtitle_font_size,
+        subtitle_margin_v=args.subtitle_margin_v,
+        subtitle_outline=args.subtitle_outline,
+        subtitle_shadow=args.subtitle_shadow,
+        subtitle_background_box=args.subtitle_background_box,
+        subtitle_box_opacity=args.subtitle_box_opacity,
+        subtitle_strip_periods=args.subtitle_strip_periods,
+        subtitle_comma_mode=args.subtitle_comma_mode,
         allow_diagnostic_on_collision=args.allow_diagnostic_on_collision,
         reuse_wav_dir=args.reuse_wav_dir,
         source_utterances_path=args.source_utterances,

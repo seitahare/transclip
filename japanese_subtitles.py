@@ -1,8 +1,13 @@
-"""Phase 10: Japanese Subtitle Engine synchronized to post-TTS speech placement.
+"""Phase 10–13: Japanese Subtitle Engine synchronized to post-TTS speech placement.
 
 Generates SRT, multi-speaker ASS, and FFmpeg subtitle-burned MP4s strictly from
 the final synthesized TTS script (`text_ja` and measured WAV placement), never
 from pre-TTS raw translations.
+
+Phase 13 UI & Readability Enhancements:
+- High-visibility styling: enhanced outline, drop shadow, and semi-transparent black background box (座布団 / BorderStyle=3) readable on bright backgrounds.
+- Size & placement: 1.2–1.3x enlarged font size, elevated bottom margin (`margin_v`), automatic scaling for arbitrary video resolutions and aspect ratios (16:9, 9:16, 1:1, 4:3), and line-overflow prevention/detection.
+- Display punctuation formatting: omits Japanese periods `「。」` and converts commas `「、」` to half-width spaces (or minimal) in rendered subtitle display lines without mutating the source translation script.
 """
 import argparse
 from dataclasses import asdict, dataclass, field
@@ -20,7 +25,17 @@ import unicodedata
 from audio_mixer import ffmpeg, probe, read_json, sha256_file, validate_feedback, validate_mp4
 from language.cache import atomic_json, fingerprint
 from language.pronunciation import count_mora
-from tts_feedback import UNKNOWN, detect_collisions, number
+
+try:
+    from tts_feedback import UNKNOWN, detect_collisions, number
+except ImportError:
+    UNKNOWN = (None, "UNKNOWN", "REVIEW", "MIXED")
+    detect_collisions = None
+
+    def number(value, label, *, positive=False):
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0 or (positive and value == 0):
+            raise ValueError(f"Invalid {label}.")
+        return value
 
 CLAUSE_BREAK_CHARS = set("。！？!?、，,…")
 PARTICLE_SURFACES = {"は", "が", "を", "に", "で", "と", "から", "まで", "より", "へ", "や", "て", "ば", "たら", "なら", "ので", "のに", "けれど", "けど", "し"}
@@ -30,21 +45,74 @@ DEFAULT_SPEAKER_COLORS = [
     "&H00FFD8A8",  # Soft sky blue (ASS BGR)
     "&H00C8FFC8",  # Soft mint green (ASS BGR)
 ]
+CONVENTIONAL_BASE_FONT_SIZE_1080P = 42
+CONVENTIONAL_BASE_MARGIN_V_1080P = 36
+
+
+def _ass_alpha_hex(opacity):
+    """Convert opacity in [0.0, 1.0] (where 1.0 is opaque) to ASS 2-digit hex transparency (00=opaque, FF=transparent)."""
+    op = max(0.0, min(1.0, float(opacity)))
+    alpha = int(round((1.0 - op) * 255.0))
+    return f"{alpha:02X}"
+
+
+def format_subtitle_display_text(text, *, strip_periods=True, comma_mode="halfwidth_space"):
+    """Format Japanese subtitle text for on-screen display without modifying the underlying script.
+
+    - Omits Japanese full stops `「。」` when `strip_periods=True`.
+    - Replaces Japanese commas `「、」` / `「，」` with a half-width space `' '` when `comma_mode='halfwidth_space'`,
+      or removes redundant commas when `comma_mode='minimal'`.
+    """
+    if comma_mode not in ("halfwidth_space", "minimal", "keep"):
+        raise ValueError(f"Unsupported comma_mode: {comma_mode!r}")
+    out = str(text or "").strip()
+    if not out:
+        return ""
+    if strip_periods:
+        out = out.replace("。", "")
+    if comma_mode == "halfwidth_space":
+        out = re.sub(r"[、，]+\s*", " ", out)
+    elif comma_mode == "minimal":
+        # Remove commas after short clauses (<5 chars) or before line end; convert remaining to half-width space
+        out = re.sub(r"[、，]+$", "", out)
+        out = re.sub(r"(?<=^.{1,4})[、，]+", "", out)
+        out = re.sub(r"[、，]+\s*", " ", out)
+    out = re.sub(r" {2,}", " ", out).strip()
+    return out
+
+
+def format_subtitle_display_lines(lines, *, strip_periods=True, comma_mode="halfwidth_space"):
+    """Format a list of wrapped subtitle lines for display while preserving non-empty line structure."""
+    formatted = []
+    for line in lines or []:
+        disp = format_subtitle_display_text(line, strip_periods=strip_periods, comma_mode=comma_mode)
+        if disp:
+            formatted.append(disp)
+    if not formatted and lines:
+        fallback = " ".join(str(x).strip() for x in lines if str(x).strip()).strip()
+        if fallback:
+            formatted = [fallback]
+    return formatted
 
 
 @dataclass(frozen=True)
 class SubtitleStyleConfig:
     font_name: str = "Noto Sans CJK JP"
-    font_size: int = 42
+    font_size: int = 52  # 1.24x of conventional 42pt on 1080p
+    font_scale: float = 1.24
     max_chars_per_line: int = 22
     max_lines: int = 2
-    outline: float = 2.5
-    shadow: float = 1.0
+    outline: float = 3.5  # Enhanced outline (up from 2.5)
+    shadow: float = 2.5   # Enhanced drop shadow (up from 1.0)
+    background_box: bool = True  # Semi-transparent black background box (座布団)
+    box_opacity: float = 0.60    # 60% opacity black background box
+    strip_periods: bool = True   # Omit 「。」 in display subtitles
+    comma_mode: str = "halfwidth_space"  # Replace 「、」 with half-width space in display subtitles
     alignment: int = 2
-    margin_l: int = 40
-    margin_r: int = 40
-    margin_v: int = 36
-    overlap_lane_step_v: int = 92
+    margin_l: int = 60
+    margin_r: int = 60
+    margin_v: int = 64  # Elevated from bottom edge (up from 36)
+    overlap_lane_step_v: int = 112
     play_res_x: int = 1920
     play_res_y: int = 1080
     speaker_colors: dict = field(default_factory=dict)
@@ -52,20 +120,202 @@ class SubtitleStyleConfig:
     def __post_init__(self):
         if not isinstance(self.font_name, str) or not self.font_name.strip():
             raise ValueError("Invalid font_name.")
-        if type(self.font_size) is not int or not 12 <= self.font_size <= 120:
+        if type(self.font_size) is not int or not 12 <= self.font_size <= 160:
             raise ValueError("Invalid font_size.")
-        if type(self.max_chars_per_line) is not int or not 8 <= self.max_chars_per_line <= 60:
+        if type(self.font_scale) not in (int, float) or not math.isfinite(self.font_scale) or not 0.5 <= self.font_scale <= 3.0:
+            raise ValueError("Invalid font_scale.")
+        if type(self.max_chars_per_line) is not int or not 6 <= self.max_chars_per_line <= 60:
             raise ValueError("Invalid max_chars_per_line.")
         if type(self.max_lines) is not int or not 1 <= self.max_lines <= 4:
             raise ValueError("Invalid max_lines.")
         if type(self.alignment) is not int or not 1 <= self.alignment <= 9:
             raise ValueError("Invalid ASS alignment (1..9).")
         for name, val in [("outline", self.outline), ("shadow", self.shadow)]:
-            if type(val) not in (int, float) or not math.isfinite(val) or val < 0 or val > 12:
+            if type(val) not in (int, float) or not math.isfinite(val) or val < 0 or val > 16:
                 raise ValueError(f"Invalid {name}.")
+        if type(self.background_box) is not bool:
+            raise ValueError("Invalid background_box.")
+        if type(self.box_opacity) not in (int, float) or not math.isfinite(self.box_opacity) or not 0.0 <= self.box_opacity <= 1.0:
+            raise ValueError("Invalid box_opacity.")
+        if type(self.strip_periods) is not bool:
+            raise ValueError("Invalid strip_periods.")
+        if self.comma_mode not in ("halfwidth_space", "minimal", "keep"):
+            raise ValueError("Invalid comma_mode.")
         for name, val in [("margin_l", self.margin_l), ("margin_r", self.margin_r), ("margin_v", self.margin_v), ("overlap_lane_step_v", self.overlap_lane_step_v)]:
-            if type(val) is not int or val < 0 or val > 600:
+            if type(val) is not int or val < 0 or val > 800:
                 raise ValueError(f"Invalid {name}.")
+
+    @classmethod
+    def for_video_resolution(
+        cls,
+        width: int = 1920,
+        height: int = 1080,
+        *,
+        font_scale: float = 1.25,
+        background_box: bool = True,
+        box_opacity: float = 0.60,
+        strip_periods: bool = True,
+        comma_mode: str = "halfwidth_space",
+        **overrides,
+    ):
+        """Construct a resolution- and aspect-ratio-aware SubtitleStyleConfig.
+
+        Automatically scales font_size (1.2–1.3x base), bottom margin_v (slightly elevated),
+        horizontal margins, outline/shadow thickness, and max_chars_per_line so subtitles
+        never overflow horizontally on 16:9, 9:16 vertical, 1:1 square, or 4:3 videos.
+        """
+        w = max(160, int(width or 1920))
+        h = max(120, int(height or 1080))
+        scale = float(font_scale)
+        aspect = w / float(h)
+
+        # Conventional base font size is ~3.88% of height on landscape (42pt on 1080p, 28pt on 720p)
+        if aspect < 0.85:
+            # Vertical / portrait video (e.g. 9:16 1080x1920): constrain font size by width
+            base_font = w * 0.042
+            margin_v = max(48, int(round(h * 0.085)))
+            margin_lr = max(24, int(round(w * 0.055)))
+        elif aspect < 1.15:
+            # Square video (e.g. 1:1 1080x1080)
+            base_font = h * 0.038
+            margin_v = max(36, int(round(h * 0.068)))
+            margin_lr = max(28, int(round(w * 0.05)))
+        else:
+            # Landscape video (16:9, 4:3, etc.)
+            base_font = h * (CONVENTIONAL_BASE_FONT_SIZE_1080P / 1080.0)
+            margin_v = max(20, int(round(h * 0.060)))
+            margin_lr = max(20, int(round(w * 0.035)))
+
+        computed_font_size = max(14, min(140, int(round(base_font * scale))))
+        usable_width = max(100, w - 2 * margin_lr)
+        # Ensure max_chars_per_line fits comfortably within usable_width (with 1.05x CJK safety factor)
+        fit_chars = max(8, min(26, int(math.floor(usable_width / max(1.0, computed_font_size * 1.04)))))
+        outline_px = round(max(1.5, min(8.0, computed_font_size * 0.068)), 2)
+        shadow_px = round(max(1.0, min(6.0, computed_font_size * 0.048)), 2)
+        lane_step = max(28, int(round(computed_font_size * 2.15)))
+
+        params = {
+            "font_name": "Noto Sans CJK JP",
+            "font_size": computed_font_size,
+            "font_scale": round(scale, 3),
+            "max_chars_per_line": fit_chars,
+            "max_lines": 2,
+            "outline": outline_px,
+            "shadow": shadow_px,
+            "background_box": bool(background_box),
+            "box_opacity": float(box_opacity),
+            "strip_periods": bool(strip_periods),
+            "comma_mode": str(comma_mode),
+            "alignment": 2,
+            "margin_l": margin_lr,
+            "margin_r": margin_lr,
+            "margin_v": margin_v,
+            "overlap_lane_step_v": lane_step,
+            "play_res_x": w,
+            "play_res_y": h,
+        }
+        params.update({k: v for k, v in overrides.items() if v is not None})
+        return cls(**params)
+
+
+def estimate_line_pixel_width(line, style: SubtitleStyleConfig):
+    """Estimate rendered pixel width of a subtitle line for overflow verification."""
+    text = str(line or "")
+    em_units = 0.0
+    for ch in text:
+        if ch.isascii():
+            em_units += 0.55
+        else:
+            em_units += 1.0
+    return round(em_units * float(style.font_size) + 2.0 * float(style.outline), 2)
+
+
+def prevent_line_overflow(lines, style: SubtitleStyleConfig):
+    """Ensure no subtitle line exceeds `style.max_chars_per_line` or available horizontal pixel width."""
+    usable_width = max(80.0, float(style.play_res_x - style.margin_l - style.margin_r))
+    max_chars_by_px = max(6, int(math.floor((usable_width - 2.0 * style.outline) / max(1.0, float(style.font_size)))))
+    effective_max_chars = min(int(style.max_chars_per_line), max_chars_by_px)
+
+    safe_lines = []
+    for line in lines or []:
+        clean = str(line).strip()
+        if not clean:
+            continue
+        while len(clean) > effective_max_chars:
+            # Find natural break point near effective_max_chars or midpoint
+            target = min(effective_max_chars, max(4, len(clean) // 2))
+            split_at = target
+            for offset in range(0, min(6, target - 2)):
+                for cand in (target - offset, min(effective_max_chars, target + offset)):
+                    if 2 <= cand < len(clean):
+                        prev_c = clean[cand - 1]
+                        next_c = clean[cand]
+                        if prev_c.isascii() and prev_c.isalnum() and next_c.isascii() and next_c.isalnum():
+                            continue
+                        if prev_c in " 、。！？はがをにでとへもやの":
+                            split_at = cand
+                            break
+                if split_at != target:
+                    break
+            safe_lines.append(clean[:split_at].strip())
+            clean = clean[split_at:].strip()
+        if clean:
+            safe_lines.append(clean)
+
+    # If wrapping exceeded max_lines, rebalance across max_lines if possible
+    if len(safe_lines) > style.max_lines and style.max_lines >= 2:
+        combined = " ".join(safe_lines) if any(" " in s for s in safe_lines) else "".join(safe_lines)
+        if len(combined) <= effective_max_chars * style.max_lines:
+            rebalanced = []
+            rem = combined
+            for i in range(style.max_lines):
+                slots_left = style.max_lines - i
+                if slots_left == 1 or len(rem) <= effective_max_chars:
+                    rebalanced.append(rem.strip())
+                    rem = ""
+                    break
+                cut = min(effective_max_chars, max(1, math.ceil(len(rem) / slots_left)))
+                rebalanced.append(rem[:cut].strip())
+                rem = rem[cut:].strip()
+            if not rem:
+                safe_lines = [s for s in rebalanced if s]
+    return safe_lines[: style.max_lines] if len(safe_lines) <= style.max_lines else safe_lines
+
+
+def check_subtitle_overflow(cues, style: SubtitleStyleConfig):
+    """Audit all subtitle cues for character count, pixel width, and vertical margin bounds."""
+    usable_width = max(80.0, float(style.play_res_x - style.margin_l - style.margin_r))
+    overflow_cues = []
+    max_px = 0.0
+    max_chars = 0
+
+    for cue in cues or []:
+        disp_lines = cue.get("display_lines") or cue.get("lines") or []
+        for l_idx, line in enumerate(disp_lines):
+            px = estimate_line_pixel_width(line, style)
+            ch_len = len(line)
+            max_px = max(max_px, px)
+            max_chars = max(max_chars, ch_len)
+            if ch_len > style.max_chars_per_line or px > usable_width + 1.0:
+                overflow_cues.append({
+                    "entry_id": cue.get("entry_id", cue.get("id")),
+                    "cue_index": cue.get("cue_index", 0),
+                    "line_index": l_idx,
+                    "line_text": line,
+                    "char_count": ch_len,
+                    "max_chars_per_line": style.max_chars_per_line,
+                    "estimated_pixel_width": px,
+                    "available_pixel_width": usable_width,
+                })
+
+    return {
+        "overflow_count": len(overflow_cues),
+        "overflow_cues": overflow_cues,
+        "max_line_char_count": max_chars,
+        "max_line_pixel_width": round(max_px, 2),
+        "available_pixel_width": round(usable_width, 2),
+        "all_lines_within_bounds": len(overflow_cues) == 0,
+    }
 
 
 def format_srt_timestamp(seconds):
@@ -194,6 +444,21 @@ def wrap_clause_units(units, *, max_chars_per_line=22, max_lines=2):
     return formatted_cues
 
 
+def _attach_display_formatting(cue, style: SubtitleStyleConfig):
+    """Attach punctuation-formatted, overflow-protected `display_lines` and `display_text_ja` while keeping `text_ja` intact."""
+    raw_lines = prevent_line_overflow(cue.get("lines") or [cue["text_ja"]], style)
+    disp_lines = format_subtitle_display_lines(
+        raw_lines,
+        strip_periods=style.strip_periods,
+        comma_mode=style.comma_mode,
+    )
+    disp_lines = prevent_line_overflow(disp_lines, style)
+    cue["lines"] = raw_lines
+    cue["display_lines"] = disp_lines
+    cue["display_text_ja"] = "\n".join(disp_lines)
+    return cue
+
+
 def _word_aligned_cues(entry, style, alignment):
     """Map script clauses to monotonic WAV-bound ASR words, never replace script text."""
     if alignment.get("time_basis") != "wav_relative" or not entry.get("audio_file"):
@@ -229,8 +494,10 @@ def _word_aligned_cues(entry, style, alignment):
         if not matched or len(matched)/max(size,1)<.7:raise ValueError("Clause is not sufficiently aligned.")
         a=start+matched[0][0];b=min(start+duration,start+matched[-1][1])
         if a<last-1e-6 or b<=a:raise ValueError("Clause boundaries overlap or are empty.")
-        cues.append({"entry_id":entry["id"],"cue_index":index,"speaker":entry["speaker"],"start":round(a,4),"end":round(b,4),
-                     "text_ja":spec["text"],"lines":spec["lines"],"timing_source":"wav_bound_whisper_words", "alignment_warnings":warnings.copy()})
+        cue_obj = {"entry_id":entry["id"],"cue_index":index,"speaker":entry["speaker"],"start":round(a,4),"end":round(b,4),
+                   "text_ja":spec["text"],"lines":spec["lines"],"timing_source":"wav_bound_whisper_words", "alignment_warnings":warnings.copy()}
+        _attach_display_formatting(cue_obj, style)
+        cues.append(cue_obj)
         last=b
     return cues,warnings
 
@@ -276,7 +543,7 @@ def align_entry_cues(entry, style: SubtitleStyleConfig, alignment_entry=None):
                 timing_source = "forced_or_whisper_alignment"
                 cues = []
                 for idx, (spec, seg) in enumerate(zip(cue_specs, segments)):
-                    cues.append({
+                    cue_obj = {
                         "entry_id": entry["id"],
                         "cue_index": idx,
                         "speaker": entry["speaker"],
@@ -286,7 +553,9 @@ def align_entry_cues(entry, style: SubtitleStyleConfig, alignment_entry=None):
                         "lines": spec["lines"],
                         "timing_source": timing_source,
                         "alignment_warnings": list(warnings),
-                    })
+                    }
+                    _attach_display_formatting(cue_obj, style)
+                    cues.append(cue_obj)
                 return cues, warnings
         elif segments is not None:
             warnings.append("alignment_segment_count_mismatch_used_proportional")
@@ -301,7 +570,7 @@ def align_entry_cues(entry, style: SubtitleStyleConfig, alignment_entry=None):
         else:
             share = duration * (spec["weight"] / total_weight)
             cue_end = min(end, cursor + share)
-        cues.append({
+        cue_obj = {
             "entry_id": entry["id"],
             "cue_index": idx,
             "speaker": entry["speaker"],
@@ -311,7 +580,9 @@ def align_entry_cues(entry, style: SubtitleStyleConfig, alignment_entry=None):
             "lines": spec["lines"],
             "timing_source": timing_source,
             "alignment_warnings": list(warnings),
-        })
+        }
+        _attach_display_formatting(cue_obj, style)
+        cues.append(cue_obj)
         cursor = cue_end
     return cues, warnings
 
@@ -413,6 +684,8 @@ def build_subtitle_plan(
             "primary_color": color,
         }
 
+    overflow_check = check_subtitle_overflow(all_cues, style)
+
     return {
         "kind": "japanese_subtitle_plan",
         "format_version": 1,
@@ -425,6 +698,7 @@ def build_subtitle_plan(
         "style": asdict(style),
         "speaker_styles": speaker_styles,
         "cues": all_cues,
+        "overflow_check": overflow_check,
         "undubbed_entries": [
             {"id": r["id"], "speaker": r["speaker"], "relative_start": r["relative_start"], "relative_end": r["relative_end"], "reason": r.get("skip_reason") or r["generation_status"]}
             for r in missing
@@ -438,12 +712,18 @@ def build_subtitle_plan(
 
 
 def render_srt(plan):
-    """Render standard UTF-8 SRT subtitles from a Japanese subtitle plan."""
+    """Render standard UTF-8 SRT subtitles from a Japanese subtitle plan using formatted display lines."""
+    st = plan.get("style") or {}
+    strip_p = bool(st.get("strip_periods", True))
+    comma_m = str(st.get("comma_mode", "halfwidth_space"))
     blocks = []
     for idx, cue in enumerate(plan["cues"], 1):
         start_ts = format_srt_timestamp(cue["start"])
         end_ts = format_srt_timestamp(cue["end"])
-        lines = list(cue["lines"])
+        raw_lines = cue.get("display_lines")
+        if not raw_lines:
+            raw_lines = format_subtitle_display_lines(cue["lines"], strip_periods=strip_p, comma_mode=comma_m)
+        lines = list(raw_lines)
         if cue.get("simultaneous_overlap") and lines:
             lines[0] = f"[{cue['speaker']}] {lines[0]}"
         blocks.append(f"{idx}\n{start_ts} --> {end_ts}\n" + "\n".join(lines))
@@ -451,8 +731,20 @@ def render_srt(plan):
 
 
 def render_ass(plan):
-    """Render UTF-8 ASS subtitles with per-speaker styles and multi-lane simultaneous overlap positioning."""
+    """Render UTF-8 ASS subtitles with per-speaker styles, semi-transparent background box (座布団),
+    enhanced outline/shadow, and multi-lane simultaneous overlap positioning.
+    """
     st = plan["style"]
+    bg_box = bool(st.get("background_box", True))
+    box_opacity = float(st.get("box_opacity", 0.60))
+    border_style = 3 if bg_box else 1
+    alpha_hex = _ass_alpha_hex(box_opacity)
+    # In ASS BorderStyle=3, OutlineColour is the box fill color and BackColour is the box drop shadow.
+    outline_col = f"&H{alpha_hex}000000" if bg_box else "&H00000000"
+    back_col = "&H80000000"
+    strip_p = bool(st.get("strip_periods", True))
+    comma_m = str(st.get("comma_mode", "halfwidth_space"))
+
     header = [
         "[Script Info]",
         f"Title: TransClip Japanese Subtitles ({plan['video_id']})",
@@ -467,13 +759,13 @@ def render_ass(plan):
     ]
     for spk, info in sorted(plan["speaker_styles"].items()):
         header.append(
-            f"Style: {info['style_name']},{st['font_name']},{st['font_size']},{info['primary_color']},&H000000FF,&H00000000,&H80000000,"
-            f"0,0,0,0,100,100,0,0,1,{st['outline']},{st['shadow']},{st['alignment']},{st['margin_l']},{st['margin_r']},{st['margin_v']},1"
+            f"Style: {info['style_name']},{st['font_name']},{st['font_size']},{info['primary_color']},&H000000FF,{outline_col},{back_col},"
+            f"1,0,0,0,100,100,0,0,{border_style},{st['outline']},{st['shadow']},{st['alignment']},{st['margin_l']},{st['margin_r']},{st['margin_v']},1"
         )
     if not plan["speaker_styles"]:
         header.append(
-            f"Style: Default,{st['font_name']},{st['font_size']},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
-            f"0,0,0,0,100,100,0,0,1,{st['outline']},{st['shadow']},{st['alignment']},{st['margin_l']},{st['margin_r']},{st['margin_v']},1"
+            f"Style: Default,{st['font_name']},{st['font_size']},&H00FFFFFF,&H000000FF,{outline_col},{back_col},"
+            f"1,0,0,0,100,100,0,0,{border_style},{st['outline']},{st['shadow']},{st['alignment']},{st['margin_l']},{st['margin_r']},{st['margin_v']},1"
         )
 
     events = [
@@ -487,9 +779,12 @@ def render_ass(plan):
         start_ts = format_ass_timestamp(cue["start"])
         end_ts = format_ass_timestamp(cue["end"])
         margin_v = st["margin_v"] + int(cue.get("lane", 0)) * st["overlap_lane_step_v"]
+        disp_lines = cue.get("display_lines")
+        if not disp_lines:
+            disp_lines = format_subtitle_display_lines(cue["lines"], strip_periods=strip_p, comma_mode=comma_m)
         escaped_lines = [
             line.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
-            for line in cue["lines"]
+            for line in disp_lines
         ]
         text_body = r"\N".join(escaped_lines)
         events.append(
@@ -582,9 +877,19 @@ def main(argv=None):
     parser.add_argument("--alignment-json", type=Path, help="Optional Whisper/Forced Alignment JSON keyed by entry_id")
     parser.add_argument("--seconds", type=float, default=30.0)
     parser.add_argument("--font-name", default="Noto Sans CJK JP")
-    parser.add_argument("--font-size", type=int, default=42)
+    parser.add_argument("--font-size", type=int, default=52)
+    parser.add_argument("--font-scale", type=float, default=1.25)
     parser.add_argument("--max-chars-per-line", type=int, default=22)
     parser.add_argument("--max-lines", type=int, default=2)
+    parser.add_argument("--outline", type=float, default=3.5)
+    parser.add_argument("--shadow", type=float, default=2.5)
+    parser.add_argument("--margin-v", type=int, default=64)
+    parser.add_argument("--background-box", dest="background_box", action="store_true", default=True)
+    parser.add_argument("--no-background-box", dest="background_box", action="store_false")
+    parser.add_argument("--box-opacity", type=float, default=0.60)
+    parser.add_argument("--strip-periods", dest="strip_periods", action="store_true", default=True)
+    parser.add_argument("--keep-periods", dest="strip_periods", action="store_false")
+    parser.add_argument("--comma-mode", choices=("halfwidth_space", "minimal", "keep"), default="halfwidth_space")
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -592,8 +897,16 @@ def main(argv=None):
         style = SubtitleStyleConfig(
             font_name=args.font_name,
             font_size=args.font_size,
+            font_scale=args.font_scale,
             max_chars_per_line=args.max_chars_per_line,
             max_lines=args.max_lines,
+            outline=args.outline,
+            shadow=args.shadow,
+            margin_v=args.margin_v,
+            background_box=args.background_box,
+            box_opacity=args.box_opacity,
+            strip_periods=args.strip_periods,
+            comma_mode=args.comma_mode,
         )
         alignment_data = read_json(args.alignment_json) if args.alignment_json else None
         plan = build_subtitle_plan(
@@ -611,6 +924,7 @@ def main(argv=None):
                 "cue_count": len(plan["cues"]),
                 "same_speaker_conflicts": plan["same_speaker_conflicts"],
                 "other_speaker_overlaps": plan["other_speaker_overlaps"],
+                "overflow_check": plan["overflow_check"],
                 "blockers": plan["blockers"],
             }, ensure_ascii=False, indent=2))
             return 0

@@ -1,6 +1,7 @@
 """Read-only Phase 2 inputs -> independent speaker timelines -> verified MP4.
 
-No NLP/TTS runtime is loaded. Rendering uses FFmpeg and Python's standard library.
+No NLP/TTS runtime is loaded. Rendering uses FFmpeg and Python's standard library
+(plus numpy for Phase 13 dynamic audio ducking, ambient separation, and loudness verification).
 """
 import argparse
 from array import array
@@ -18,15 +19,35 @@ import sys
 import tempfile
 import wave
 
+import numpy as np
+
 from language.cache import atomic_json, fingerprint
 from language.timing import measure_wav
-from tts_feedback import UNKNOWN, detect_collisions, number, validate_script, audio_request
+
+try:
+    from tts_feedback import UNKNOWN, detect_collisions, number, validate_script, audio_request
+except ImportError:
+    UNKNOWN = (None, "UNKNOWN", "REVIEW", "MIXED")
+    detect_collisions = validate_script = audio_request = None
+
+    def number(value, label, *, positive=False):
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0 or (positive and value == 0):
+            raise ValueError(f"Invalid {label}.")
+        return value
 
 BASE_DIR = Path(__file__).resolve().parent
 RATE = 48000
 CHANNELS = 2
 ENGINE_VERSION = 1
 PEAK_TARGET = 10 ** (-2 / 20)
+VALID_MIX_MODES = (
+    "japanese-only",
+    "reference-mix",
+    "voiceover",
+    "ducking",
+    "ambient",
+    "hybrid-ambient",
+)
 
 
 def read_json(path):
@@ -67,6 +88,454 @@ def resolve_input(value, parent, label):
         raise ValueError(f"Missing {label}.")
     path = Path(value)
     return (parent / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+# ============================================================================
+# Phase 13: Dynamic Audio Ducking (Voice-Over), Ambient Separation & Loudness
+# ============================================================================
+
+def merge_speech_intervals(intervals, *, total_duration_seconds=None, pre_duck_seconds=0.06,
+                          post_duck_seconds=0.08, min_unspoken_gap_seconds=0.35):
+    """Normalize and merge active Japanese TTS speech intervals, bridging micro-gaps."""
+    cleaned = []
+    for item in intervals or []:
+        if isinstance(item, dict):
+            a = float(item.get("start", item.get("placement_seconds", item.get("clip_relative_start_seconds", 0.0))))
+            b = float(item.get("end", a + float(item.get("duration", item.get("actual_tts_duration_seconds", 0.0)))))
+        else:
+            a, b = float(item[0]), float(item[1])
+        if not (math.isfinite(a) and math.isfinite(b)) or b <= a:
+            continue
+        expanded_a = max(0.0, a - max(0.0, float(pre_duck_seconds)))
+        expanded_b = b + max(0.0, float(post_duck_seconds))
+        if total_duration_seconds is not None and total_duration_seconds > 0:
+            expanded_a = min(float(total_duration_seconds), expanded_a)
+            expanded_b = min(float(total_duration_seconds), expanded_b)
+        if expanded_b > expanded_a:
+            cleaned.append((expanded_a, expanded_b))
+
+    if not cleaned:
+        return []
+    cleaned.sort(key=lambda x: (x[0], x[1]))
+    merged = [cleaned[0]]
+    bridge = max(0.0, float(min_unspoken_gap_seconds))
+    for a, b in cleaned[1:]:
+        prev_a, prev_b = merged[-1]
+        if a - prev_b <= bridge + 1e-6:
+            merged[-1] = (prev_a, max(prev_b, b))
+        else:
+            merged.append((a, b))
+    return [(round(a, 6), round(b, 6)) for a, b in merged]
+
+
+def build_ducking_envelope(
+    total_frames,
+    *,
+    sample_rate=RATE,
+    speech_intervals=(),
+    duck_gain=0.12,
+    unspoken_gain=1.0,
+    fade_out_seconds=0.18,
+    fade_in_seconds=0.25,
+    pre_duck_seconds=0.06,
+    post_duck_seconds=0.08,
+    min_unspoken_gap_seconds=0.35,
+    curve="cosine",
+):
+    """Build a sample-accurate 1D gain envelope for voice-over ducking.
+
+    - During active Japanese TTS speech: attenuates original audio to `duck_gain` (e.g. 0.10..0.15).
+    - During non-TTS intervals: retains original audio at `unspoken_gain` (default 1.0).
+    - Applies smooth raised-cosine (or linear) fade-out before speech starts and fade-in after speech ends.
+    """
+    if type(total_frames) is not int or total_frames <= 0:
+        raise ValueError("total_frames must be a positive integer.")
+    if type(sample_rate) is not int or sample_rate <= 0:
+        raise ValueError("sample_rate must be a positive integer.")
+    for label, val, lo, hi in [
+        ("duck_gain", duck_gain, 0.0, 0.5),
+        ("unspoken_gain", unspoken_gain, 0.0, 1.5),
+        ("fade_out_seconds", fade_out_seconds, 0.0, 3.0),
+        ("fade_in_seconds", fade_in_seconds, 0.0, 3.0),
+        ("pre_duck_seconds", pre_duck_seconds, 0.0, 1.0),
+        ("post_duck_seconds", post_duck_seconds, 0.0, 1.0),
+        ("min_unspoken_gap_seconds", min_unspoken_gap_seconds, 0.0, 5.0),
+    ]:
+        if type(val) not in (int, float) or not math.isfinite(val) or not (lo <= val <= hi):
+            raise ValueError(f"Invalid {label}: {val}")
+    if curve not in ("cosine", "linear"):
+        raise ValueError("curve must be 'cosine' or 'linear'.")
+
+    total_duration = total_frames / float(sample_rate)
+    merged = merge_speech_intervals(
+        speech_intervals,
+        total_duration_seconds=total_duration,
+        pre_duck_seconds=pre_duck_seconds,
+        post_duck_seconds=post_duck_seconds,
+        min_unspoken_gap_seconds=min_unspoken_gap_seconds,
+    )
+
+    duck_g = float(duck_gain)
+    unspoken_g = float(unspoken_gain)
+    env = np.full(total_frames, unspoken_g, dtype=np.float32)
+    if not merged or abs(unspoken_g - duck_g) < 1e-7:
+        return env, {
+            "duck_gain": duck_g,
+            "unspoken_gain": unspoken_g,
+            "fade_out_seconds": float(fade_out_seconds),
+            "fade_in_seconds": float(fade_in_seconds),
+            "curve": curve,
+            "merged_speech_windows": merged,
+            "transition_count": 0,
+            "ducked_frame_fraction": 0.0 if not merged else 1.0,
+            "unspoken_frame_fraction": 1.0 if not merged else 0.0,
+            "min_gain": float(np.min(env)),
+            "max_gain": float(np.max(env)),
+        }
+
+    fade_out_frames = max(1, int(round(float(fade_out_seconds) * sample_rate))) if fade_out_seconds > 0 else 0
+    fade_in_frames = max(1, int(round(float(fade_in_seconds) * sample_rate))) if fade_in_seconds > 0 else 0
+
+    for a_sec, b_sec in merged:
+        s_idx = max(0, min(total_frames, int(round(a_sec * sample_rate))))
+        e_idx = max(s_idx, min(total_frames, int(round(b_sec * sample_rate))))
+        if e_idx > s_idx:
+            env[s_idx:e_idx] = np.minimum(env[s_idx:e_idx], duck_g)
+
+        # Smooth fade-out (attack) leading into s_idx
+        if fade_out_frames > 0 and s_idx > 0:
+            ramp_start = max(0, s_idx - fade_out_frames)
+            ramp_len = s_idx - ramp_start
+            if ramp_len > 0:
+                t = np.linspace(0.0, 1.0, ramp_len, endpoint=False, dtype=np.float32)
+                w = (0.5 * (1.0 - np.cos(np.pi * t))).astype(np.float32) if curve == "cosine" else t
+                ramp_vals = unspoken_g - (unspoken_g - duck_g) * w
+                env[ramp_start:s_idx] = np.minimum(env[ramp_start:s_idx], ramp_vals)
+
+        # Smooth fade-in (release) trailing after e_idx
+        if fade_in_frames > 0 and e_idx < total_frames:
+            ramp_end = min(total_frames, e_idx + fade_in_frames)
+            ramp_len = ramp_end - e_idx
+            if ramp_len > 0:
+                t = np.linspace(0.0, 1.0, ramp_len, endpoint=False, dtype=np.float32)
+                w = (0.5 * (1.0 - np.cos(np.pi * t))).astype(np.float32) if curve == "cosine" else t
+                ramp_vals = duck_g + (unspoken_g - duck_g) * w
+                env[e_idx:ramp_end] = np.minimum(env[e_idx:ramp_end], ramp_vals)
+
+    ducked_mask = np.abs(env - duck_g) <= 0.02 * max(1.0, abs(unspoken_g - duck_g))
+    unspoken_mask = np.abs(env - unspoken_g) <= 0.02 * max(1.0, abs(unspoken_g - duck_g))
+    return env, {
+        "duck_gain": duck_g,
+        "unspoken_gain": unspoken_g,
+        "fade_out_seconds": float(fade_out_seconds),
+        "fade_in_seconds": float(fade_in_seconds),
+        "pre_duck_seconds": float(pre_duck_seconds),
+        "post_duck_seconds": float(post_duck_seconds),
+        "min_unspoken_gap_seconds": float(min_unspoken_gap_seconds),
+        "curve": curve,
+        "merged_speech_windows": merged,
+        "transition_count": len(merged) * 2,
+        "ducked_frame_fraction": round(float(np.mean(ducked_mask)), 4),
+        "unspoken_frame_fraction": round(float(np.mean(unspoken_mask)), 4),
+        "min_gain": round(float(np.min(env)), 4),
+        "max_gain": round(float(np.max(env)), 4),
+    }
+
+
+def _dsp_spectral_separate_ambient(samples, sample_rate=RATE, *, vocal_suppression_db=18.0):
+    """Zero-dependency STFT spectral vocal suppression & ambient/room-tone extractor.
+
+    Suppresses human speech fundamental & formant frequencies (120..3800 Hz) where vocal
+    harmonicity/energy exceeds the stationary room-tone floor, while preserving stereo side
+    ambience, low/high room acoustics, and non-speech atmosphere.
+    """
+    arr = np.asarray(samples, dtype=np.float32)
+    is_1d = arr.ndim == 1
+    if is_1d:
+        stereo = arr[:, None]
+    elif arr.ndim == 2:
+        stereo = arr
+    else:
+        raise ValueError("Audio array must be 1D (mono) or 2D [frames, channels].")
+
+    n_frames, n_ch = stereo.shape
+    if n_frames == 0:
+        return arr.copy(), np.zeros_like(arr)
+
+    n_fft = max(256, min(2048, 2 ** int( round(math.log2(max(256, sample_rate * 0.04))) )))
+    hop = n_fft // 4
+    win = np.hanning(n_fft).astype(np.float32)
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / float(sample_rate))
+
+    # Vocal formant attenuation profile (smooth bandpass mask in 120..3800 Hz)
+    vocal_band = np.zeros_like(freqs, dtype=np.float32)
+    in_band = (freqs >= 110.0) & (freqs <= 4000.0)
+    vocal_band[in_band] = 1.0
+    # Smooth edges around 110..220 Hz and 3000..4000 Hz
+    low_edge = (freqs >= 110.0) & (freqs < 220.0)
+    vocal_band[low_edge] = (freqs[low_edge] - 110.0) / 110.0
+    high_edge = (freqs > 3000.0) & (freqs <= 4000.0)
+    vocal_band[high_edge] = (4000.0 - freqs[high_edge]) / 1000.0
+
+    min_vocal_gain = float(10.0 ** (-abs(float(vocal_suppression_db)) / 20.0))
+
+    def _extract_mono_ambient(x_1d):
+        if len(x_1d) < n_fft:
+            return x_1d * 0.25
+        pad_len = n_fft + (hop - (len(x_1d) % hop)) % hop
+        padded = np.pad(x_1d, (n_fft // 2, pad_len), mode="reflect")
+        frames = np.lib.stride_tricks.sliding_window_view(padded, n_fft)[::hop]
+        windowed = frames * win[None, :]
+        spec = np.fft.rfft(windowed, axis=1)
+        mag = np.abs(spec)
+
+        # Stationary room-tone floor per frequency bin (20th percentile across time)
+        floor_mag = np.percentile(mag, 20, axis=0, keepdims=True).astype(np.float32)
+        # Wiener-like ambient mask: keep stationary floor + non-vocal bands, attenuate transient vocal bursts
+        ambient_ratio = np.clip(floor_mag / np.maximum(mag, 1e-7), min_vocal_gain, 1.0)
+        mask = 1.0 - vocal_band[None, :] * (1.0 - ambient_ratio)
+        mask = np.clip(mask, min_vocal_gain, 1.0)
+
+        amb_spec = spec * mask
+        amb_frames = np.fft.irfft(amb_spec, n=n_fft, axis=1).astype(np.float32) * win[None, :]
+
+        out_len = (len(amb_frames) - 1) * hop + n_fft
+        out = np.zeros(out_len, dtype=np.float32)
+        norm = np.zeros(out_len, dtype=np.float32)
+        win_sq = (win * win).astype(np.float32)
+        for idx in range(len(amb_frames)):
+            pos = idx * hop
+            out[pos : pos + n_fft] += amb_frames[idx]
+            norm[pos : pos + n_fft] += win_sq
+        out /= np.maximum(norm, 1e-6)
+        start = n_fft // 2
+        return out[start : start + len(x_1d)]
+
+    if n_ch == 2:
+        mid = 0.5 * (stereo[:, 0] + stereo[:, 1])
+        side = 0.5 * (stereo[:, 0] - stereo[:, 1])
+        mid_amb = _extract_mono_ambient(mid)
+        # Stereo side channel naturally carries room reverberation/ambience while center voice cancels
+        amb_l = np.clip(mid_amb + 0.85 * side, -1.0, 1.0)
+        amb_r = np.clip(mid_amb - 0.85 * side, -1.0, 1.0)
+        ambient = np.stack([amb_l, amb_r], axis=1).astype(np.float32)
+    else:
+        channels_amb = [_extract_mono_ambient(stereo[:, c]) for c in range(n_ch)]
+        ambient = np.stack(channels_amb, axis=1).astype(np.float32)
+
+    speech = (stereo - ambient).astype(np.float32)
+    if is_1d:
+        return ambient[:, 0], speech[:, 0]
+    return ambient, speech
+
+
+def separate_ambient_and_speech(
+    audio_samples,
+    sample_rate=RATE,
+    *,
+    backend="auto",
+    weights_path=None,
+    model_config=None,
+    allow_fallback=True,
+):
+    """Separate original audio into background ambient/room-tone stem and speaker voice stem.
+
+    Supports external neural backends ('demucs', 'torchscript', 'convtasnet') when available
+    and a built-in DSP spectral ambient separator ('dsp') so separation works in any environment.
+    """
+    valid_backends = ("auto", "dsp", "demucs", "torchscript", "convtasnet", "none")
+    if backend not in valid_backends:
+        raise ValueError(f"Unsupported ambient separation backend {backend!r}; expected {valid_backends}")
+
+    arr = np.asarray(audio_samples, dtype=np.float32)
+    if not np.isfinite(arr).all():
+        raise ValueError("Non-finite samples in source audio for ambient separation.")
+
+    if backend == "none":
+        if not allow_fallback:
+            raise RuntimeError("Ambient separation backend is set to 'none' and fallback is disabled.")
+        return {
+            "ambient": arr * 0.12,
+            "speech": arr * 0.88,
+            "backend_requested": backend,
+            "backend_used": "ducking_fallback",
+            "fallback_used": True,
+            "separation_available": False,
+        }
+
+    # Try external TorchScript / ConvTasNet separator if explicitly requested and weights exist
+    if backend in ("torchscript", "convtasnet"):
+        try:
+            if not weights_path or not Path(weights_path).is_file():
+                raise FileNotFoundError(f"Weights file required for {backend} separation: {weights_path}")
+            from separation_backends import ConvTasNetSeparator, TorchScriptSeparator
+            mono = arr.mean(axis=1) if arr.ndim == 2 else arr
+            sep = (
+                ConvTasNetSeparator(weights_path)
+                if backend == "convtasnet"
+                else TorchScriptSeparator(weights_path, model_config or {})
+            )
+            stems = sep.separate(mono.astype(np.float32), int(sample_rate), 2)
+            # Identify lower-voiced stem as ambient bed
+            rms_vals = [float(np.sqrt(np.mean(np.square(s, dtype=np.float64)))) for s in stems]
+            amb_idx = int(np.argmin(rms_vals))
+            spk_idx = 1 - amb_idx
+            amb_mono = np.asarray(stems[amb_idx], dtype=np.float32)
+            spk_mono = np.asarray(stems[spk_idx], dtype=np.float32)
+            if arr.ndim == 2:
+                amb_out = np.repeat(amb_mono[:, None], arr.shape[1], axis=1)
+                spk_out = np.repeat(spk_mono[:, None], arr.shape[1], axis=1)
+            else:
+                amb_out, spk_out = amb_mono, spk_mono
+            return {
+                "ambient": amb_out,
+                "speech": spk_out,
+                "backend_requested": backend,
+                "backend_used": backend,
+                "fallback_used": False,
+                "separation_available": True,
+            }
+        except Exception as exc:
+            if not allow_fallback:
+                raise RuntimeError(f"Ambient separation backend {backend!r} failed: {exc}") from exc
+
+    # Built-in DSP spectral ambient separator (default for 'auto' and 'dsp', or fallback when neural unavailable)
+    try:
+        ambient, speech = _dsp_spectral_separate_ambient(arr, sample_rate=sample_rate)
+        orig_rms = float(np.sqrt(np.mean(np.square(arr, dtype=np.float64)))) if arr.size else 0.0
+        amb_rms = float(np.sqrt(np.mean(np.square(ambient, dtype=np.float64)))) if ambient.size else 0.0
+        spk_rms = float(np.sqrt(np.mean(np.square(speech, dtype=np.float64)))) if speech.size else 0.0
+        return {
+            "ambient": ambient,
+            "speech": speech,
+            "backend_requested": backend,
+            "backend_used": "dsp_spectral_ambient",
+            "fallback_used": backend not in ("auto", "dsp"),
+            "separation_available": True,
+            "metrics": {
+                "original_rms": round(orig_rms, 6),
+                "ambient_rms": round(amb_rms, 6),
+                "speech_rms": round(spk_rms, 6),
+                "ambient_to_original_rms_ratio": round(amb_rms / max(orig_rms, 1e-8), 4),
+            },
+        }
+    except Exception as exc:
+        if not allow_fallback:
+            raise
+        return {
+            "ambient": arr * 0.12,
+            "speech": arr * 0.88,
+            "backend_requested": backend,
+            "backend_used": "ducking_fallback",
+            "fallback_used": True,
+            "separation_available": False,
+            "fallback_reason": str(exc),
+        }
+
+
+def apply_soft_limiter(samples, *, ceiling=PEAK_TARGET, knee=0.70):
+    """Apply smooth soft-knee limiting above `knee` so peaks never exceed `ceiling` or clip."""
+    arr = np.asarray(samples, dtype=np.float64)
+    if arr.size == 0:
+        return arr.astype(np.float32), {"pre_peak": 0.0, "post_peak": 0.0, "limited_samples": 0}
+    pre_peak = float(np.max(np.abs(arr)))
+    ceil_val = float(ceiling)
+    knee_val = min(float(knee), ceil_val * 0.95)
+    if pre_peak <= ceil_val:
+        return arr.astype(np.float32), {"pre_peak": round(pre_peak, 6), "post_peak": round(pre_peak, 6), "limited_samples": 0}
+
+    abs_x = np.abs(arr)
+    over_mask = abs_x > knee_val
+    limited_count = int(np.sum(over_mask))
+    span = max(1e-6, ceil_val - knee_val)
+    out = arr.copy()
+    excess = (abs_x[over_mask] - knee_val) / span
+    compressed = knee_val + span * np.tanh(excess)
+    out[over_mask] = np.sign(arr[over_mask]) * compressed
+    post_peak = float(np.max(np.abs(out)))
+    if post_peak > ceil_val:
+        out *= ceil_val / post_peak
+        post_peak = float(np.max(np.abs(out)))
+    return out.astype(np.float32), {
+        "pre_peak": round(pre_peak, 6),
+        "post_peak": round(post_peak, 6),
+        "limited_samples": limited_count,
+    }
+
+
+def verify_audio_loudness_and_clipping(
+    mixed_samples,
+    *,
+    japanese_samples=None,
+    background_samples=None,
+    source_samples=None,
+    sample_rate=RATE,
+    speech_intervals=(),
+):
+    """Compute volume, loudness (dBFS / approximate LUFS), dynamic range, and clipping verification metrics."""
+    mix_arr = np.asarray(mixed_samples, dtype=np.float64)
+    if mix_arr.ndim == 2:
+        mix_mono = np.mean(mix_arr, axis=1)
+    else:
+        mix_mono = mix_arr
+
+    def _dbfs(rms_or_peak):
+        return round(20.0 * math.log10(max(float(rms_or_peak), 1e-9)), 2)
+
+    peak_val = float(np.max(np.abs(mix_arr))) if mix_arr.size else 0.0
+    rms_val = float(np.sqrt(np.mean(np.square(mix_mono)))) if mix_mono.size else 0.0
+    clipped_count = int(np.sum(np.abs(mix_arr) >= 0.9999))
+    clipped_fraction = round(clipped_count / max(1, int(mix_arr.size)), 6)
+
+    n_frames = len(mix_mono)
+    speech_mask = np.zeros(n_frames, dtype=bool)
+    for item in speech_intervals or []:
+        if isinstance(item, dict):
+            a = float(item.get("start", item.get("placement_seconds", item.get("clip_relative_start_seconds", 0.0))))
+            b = float(item.get("end", a + float(item.get("duration", item.get("actual_tts_duration_seconds", 0.0)))))
+        else:
+            a, b = float(item[0]), float(item[1])
+        s_i = max(0, min(n_frames, int(round(a * sample_rate))))
+        e_i = max(s_i, min(n_frames, int(round(b * sample_rate))))
+        if e_i > s_i:
+            speech_mask[s_i:e_i] = True
+
+    unspoken_mask = ~speech_mask
+    speech_rms = float(np.sqrt(np.mean(np.square(mix_mono[speech_mask])))) if np.any(speech_mask) else 0.0
+    unspoken_rms = float(np.sqrt(np.mean(np.square(mix_mono[unspoken_mask])))) if np.any(unspoken_mask) else 0.0
+
+    bg_speech_rms = None
+    src_speech_rms = None
+    measured_duck_ratio = None
+    if background_samples is not None:
+        bg_arr = np.asarray(background_samples, dtype=np.float64)
+        bg_mono = np.mean(bg_arr, axis=1) if bg_arr.ndim == 2 else bg_arr
+        if len(bg_mono) == n_frames and np.any(speech_mask):
+            bg_speech_rms = float(np.sqrt(np.mean(np.square(bg_mono[speech_mask]))))
+    if source_samples is not None:
+        src_arr = np.asarray(source_samples, dtype=np.float64)
+        src_mono = np.mean(src_arr, axis=1) if src_arr.ndim == 2 else src_arr
+        if len(src_mono) == n_frames and np.any(speech_mask):
+            src_speech_rms = float(np.sqrt(np.mean(np.square(src_mono[speech_mask]))))
+            if bg_speech_rms is not None and src_speech_rms > 1e-7:
+                measured_duck_ratio = round(bg_speech_rms / src_speech_rms, 4)
+
+    return {
+        "peak_amplitude": round(peak_val, 6),
+        "peak_dbfs": _dbfs(peak_val),
+        "rms_amplitude": round(rms_val, 6),
+        "rms_dbfs": _dbfs(rms_val),
+        "integrated_lufs_approx": round(_dbfs(rms_val) - 0.691, 2),
+        "clipped_sample_count": clipped_count,
+        "clipped_sample_fraction": clipped_fraction,
+        "speech_interval_rms": round(speech_rms, 6),
+        "speech_interval_dbfs": _dbfs(speech_rms) if speech_rms > 0 else None,
+        "unspoken_interval_rms": round(unspoken_rms, 6),
+        "unspoken_interval_dbfs": _dbfs(unspoken_rms) if unspoken_rms > 0 else None,
+        "background_during_speech_rms": round(bg_speech_rms, 6) if bg_speech_rms is not None else None,
+        "measured_duck_ratio_during_speech": measured_duck_ratio,
+        "clipping_free": clipped_count == 0 and peak_val < 1.0,
+    }
 
 
 def validate_feedback(feedback_path, selection_path, video_id):
@@ -206,12 +675,13 @@ def attach_speaker_evidence(plan, analysis_path):
 
 
 def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *, seconds=30,
-               mode="japanese-only", diagnostic=False, extend_to_fit=False, reference_gain=.12, max_timing_shift=0):
+               mode="japanese-only", diagnostic=False, extend_to_fit=False, reference_gain=.12, max_timing_shift=0,
+               unspoken_gain=1.0, fade_out_seconds=.18, fade_in_seconds=.25, ambient_backend="auto", ambient_gain=.85):
     number(max_timing_shift, "maximum timing shift")
     if max_timing_shift > 2:raise ValueError("Maximum timing shift is limited to 2 seconds.")
     number(seconds, "seconds", positive=True)
     number(reference_gain, "reference gain")
-    if reference_gain > .5 or mode not in ("japanese-only", "reference-mix"):
+    if reference_gain > .5 or mode not in VALID_MIX_MODES:
         raise ValueError("Invalid mode or reference gain (allowed 0..0.5).")
     feedback, rows, selection, script_path = validate_feedback(feedback_path, selection_path, video_id)
     metadata = read_json(info_path)
@@ -231,7 +701,7 @@ def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *
         declared = number(metadata["duration"], "source metadata duration", positive=True)
         if abs(source_duration - declared) > 2:
             raise ValueError("Source media duration does not match source.info.json.")
-    if mode == "reference-mix" and not any(s.get("codec_type") == "audio" for s in video_info["streams"]):
+    if mode != "japanese-only" and not any(s.get("codec_type") == "audio" for s in video_info["streams"]):
         raise ValueError("Reference Mix requires a source audio stream.")
     if seconds > feedback["preview"]["relative_end"] or seconds > selection["end"] - selection["start"]:
         raise ValueError("Requested preview exceeds feedback/selection coverage.")
@@ -287,14 +757,35 @@ def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *
     quality = "diagnostic" if diagnostic else "reviewed"
     if same: quality += "_conflicts"
     if missing or excluded: quality += "_partial"
+
+    if mode == "japanese-only":
+        policy = "muted"
+    elif mode == "reference-mix":
+        policy = "quiet English reference; no speech separation"
+    elif mode in ("voiceover", "ducking"):
+        policy = f"dynamic voice-over ducking (speech={reference_gain:.2f}, unspoken={unspoken_gain:.2f})"
+    else:
+        policy = f"separated ambient preservation ({ambient_backend}, ambient_gain={ambient_gain:.2f}, duck_gain={reference_gain:.2f})"
+
+    extra_phase13 = {}
+    if mode in ("voiceover", "ducking", "ambient", "hybrid-ambient"):
+        extra_phase13 = {
+            "unspoken_gain": float(unspoken_gain),
+            "fade_out_seconds": float(fade_out_seconds),
+            "fade_in_seconds": float(fade_in_seconds),
+            "ambient_backend": str(ambient_backend),
+            "ambient_gain": float(ambient_gain),
+        }
+
     return {"format_version": 1, "kind": "audio_mix", "engine_version": ENGINE_VERSION,
             "video_id": video_id, "clip": feedback["clip"], "preview_seconds_requested": seconds,
             "duration_seconds": duration, "absolute_video_start": selection["start"],
             "absolute_video_end": selection["start"] + duration,
             "mode": mode, "diagnostic": diagnostic, "quality_label": quality,
             **({"timing_adjustment":timing_adjustment} if timing_adjustment else {}),
-            "reference_gain": reference_gain if mode == "reference-mix" else 0,
-            "source_audio_policy": "quiet English reference; no speech separation" if mode == "reference-mix" else "muted",
+            **extra_phase13,
+            "reference_gain": reference_gain if mode != "japanese-only" else 0,
+            "source_audio_policy": policy,
             "sample_rate": RATE, "channels": CHANNELS, "sample_frames": frames,
             "placements": complete, "undubbed_entries": missing,
             "source_excluded": feedback.get("source_excluded", []), "excluded_intersecting_preview": excluded,
@@ -410,6 +901,8 @@ def render_plan(plan, output_dir):
                 tracks[speaker] = speaker_audio([r for r in plan["placements"] if r["speaker"] == speaker], plan["sample_frames"])
             japanese = add_audio(list(tracks.values()))
             final = japanese
+            ducking_report = None
+            separation_report = None
             if plan["mode"] == "reference-mix":
                 data = ffmpeg(["-ss", str(plan["absolute_video_start"]), "-i", source,
                                "-t", str(plan["duration_seconds"]), "-map", "0:a:0", "-vn",
@@ -419,6 +912,53 @@ def render_plan(plan, output_dir):
                 if len(reference) != len(japanese): raise ValueError("Reference track duration mismatch.")
                 reference = array("f", (v * plan["reference_gain"] for v in reference))
                 final = add_audio([japanese, reference])
+            elif plan["mode"] in ("voiceover", "ducking", "ambient", "hybrid-ambient"):
+                data = ffmpeg(["-ss", str(plan["absolute_video_start"]), "-i", source,
+                               "-t", str(plan["duration_seconds"]), "-map", "0:a:0", "-vn",
+                               "-af", f"aresample={RATE},apad=whole_len={plan['sample_frames']}",
+                               "-ar", str(RATE), "-ac", str(CHANNELS), "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1"])
+                raw_ref = float_samples(data)
+                if len(raw_ref) != len(japanese):
+                    raise ValueError("Reference track duration mismatch.")
+                src_stereo = np.frombuffer(raw_ref, dtype=np.float32).reshape(plan["sample_frames"], CHANNELS)
+                jp_stereo = np.frombuffer(japanese, dtype=np.float32).reshape(plan["sample_frames"], CHANNELS)
+                speech_wins = [
+                    (r["placement_seconds"], r["placement_seconds"] + r["actual_tts_duration_seconds"])
+                    for r in plan["placements"]
+                ]
+                env, ducking_report = build_ducking_envelope(
+                    plan["sample_frames"],
+                    sample_rate=RATE,
+                    speech_intervals=speech_wins,
+                    duck_gain=float(plan.get("reference_gain", 0.12)),
+                    unspoken_gain=float(plan.get("unspoken_gain", 1.0)),
+                    fade_out_seconds=float(plan.get("fade_out_seconds", 0.18)),
+                    fade_in_seconds=float(plan.get("fade_in_seconds", 0.25)),
+                )
+                if plan["mode"] in ("ambient", "hybrid-ambient"):
+                    sep = separate_ambient_and_speech(
+                        src_stereo,
+                        sample_rate=RATE,
+                        backend=plan.get("ambient_backend", "auto"),
+                        allow_fallback=True,
+                    )
+                    separation_report = {
+                        k: v for k, v in sep.items() if k not in ("ambient", "speech")
+                    }
+                    amb_gain = float(plan.get("ambient_gain", 0.85))
+                    residual_voice_gain = float(plan.get("reference_gain", 0.12)) if plan["mode"] == "hybrid-ambient" else float(plan.get("reference_gain", 0.12)) * 0.35
+                    # During speech: separated ambient bed + ducked residual voice; during non-speech: smooth transition to original audio
+                    speech_weight = (float(plan.get("unspoken_gain", 1.0)) - env) / max(1e-6, abs(float(plan.get("unspoken_gain", 1.0)) - float(plan.get("reference_gain", 0.12))))
+                    speech_weight = np.clip(speech_weight, 0.0, 1.0)[:, None]
+                    bg_during_speech = sep["ambient"] * amb_gain + sep["speech"] * residual_voice_gain
+                    bg_unspoken = src_stereo * float(plan.get("unspoken_gain", 1.0))
+                    bg_stereo = speech_weight * bg_during_speech + (1.0 - speech_weight) * bg_unspoken
+                else:
+                    bg_stereo = src_stereo * env[:, None]
+
+                mixed_stereo = (jp_stereo + bg_stereo).astype(np.float32)
+                final = array("f", mixed_stereo.reshape(-1).tolist())
+
             before_peak = max(peak(v) for v in [*tracks.values(), japanese, final])
             gain = min(1, PEAK_TARGET / before_peak) if before_peak else 1
             measurements = {}
@@ -451,6 +991,8 @@ def render_plan(plan, output_dir):
                     raise ValueError(f"Input {label} changed during rendering.")
             result = {**plan, "mix_key": key, "status": "diagnostic_preview" if plan["diagnostic"] else "rendered",
                       "video_file": video_name, "japanese_audio_file": jp_name, "mixed_audio_file": mix_name,
+                      **({"ducking_envelope": ducking_report} if ducking_report else {}),
+                      **({"ambient_separation": separation_report} if separation_report else {}),
                       "gain": {"linear": gain, "decibels": 20*math.log10(gain), "pre_gain_peak": before_peak,
                                "target_peak": PEAK_TARGET, "policy": "shared static attenuation; no time stretch or limiter"},
                       "wav_measurements": measurements, "verification": verification,
@@ -472,8 +1014,13 @@ def main(argv=None):
     parser.add_argument("--source-info", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--seconds", type=float, default=30)
-    parser.add_argument("--mode", choices=("japanese-only", "reference-mix"), default="japanese-only")
-    parser.add_argument("--reference-gain", type=float, default=.12)
+    parser.add_argument("--mode", choices=VALID_MIX_MODES, default="japanese-only")
+    parser.add_argument("--reference-gain", "--duck-gain", dest="reference_gain", type=float, default=.12)
+    parser.add_argument("--unspoken-gain", type=float, default=1.0, help="Original audio gain during non-TTS intervals in voiceover/ambient modes")
+    parser.add_argument("--fade-out-seconds", type=float, default=.18, help="Ducking fade-out duration before TTS starts")
+    parser.add_argument("--fade-in-seconds", type=float, default=.25, help="Ducking fade-in duration after TTS ends")
+    parser.add_argument("--ambient-backend", choices=("auto", "dsp", "demucs", "torchscript", "convtasnet", "none"), default="auto")
+    parser.add_argument("--ambient-gain", type=float, default=.85)
     parser.add_argument("--diagnostic", action="store_true", help="Explicitly allow reported collisions and undubbed/review entries")
     parser.add_argument("--extend-to-fit", action="store_true", help="Extend only within selection to keep complete speech")
     parser.add_argument("--max-timing-shift",type=float,default=0,help="Opt-in adjacent same-speaker delay, 0..2 seconds; no time stretching")
@@ -485,7 +1032,9 @@ def main(argv=None):
         plan = build_plan(args.feedback, args.selection or inputs / "selection.json",
                           args.source_video or inputs / "source.mp4", args.source_info or inputs / "source.info.json",
                           args.video_id, seconds=args.seconds, mode=args.mode, diagnostic=args.diagnostic,
-                          extend_to_fit=args.extend_to_fit, reference_gain=args.reference_gain,max_timing_shift=args.max_timing_shift)
+                          extend_to_fit=args.extend_to_fit, reference_gain=args.reference_gain, max_timing_shift=args.max_timing_shift,
+                          unspoken_gain=args.unspoken_gain, fade_out_seconds=args.fade_out_seconds, fade_in_seconds=args.fade_in_seconds,
+                          ambient_backend=args.ambient_backend, ambient_gain=args.ambient_gain)
         if args.speaker_analysis:
             attach_speaker_evidence(plan, args.speaker_analysis)
         print(json.dumps({k: plan[k] for k in ("video_id", "quality_label", "duration_seconds", "same_speaker_conflicts",
