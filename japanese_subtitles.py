@@ -188,8 +188,8 @@ class SubtitleStyleConfig:
 
         computed_font_size = max(14, min(140, int(round(base_font * scale))))
         usable_width = max(100, w - 2 * margin_lr)
-        # Ensure max_chars_per_line fits comfortably within usable_width (with 1.05x CJK safety factor)
-        fit_chars = max(8, min(26, int(math.floor(usable_width / max(1.0, computed_font_size * 1.04)))))
+        # Phase 13.2: Target 20-22 chars per line on landscape (clamped to <= 22 and constrained by usable pixel width)
+        fit_chars = max(8, min(22, int(math.floor(usable_width / max(1.0, computed_font_size * 1.06)))))
         outline_px = round(max(1.5, min(8.0, computed_font_size * 0.068)), 2)
         shadow_px = round(max(1.0, min(6.0, computed_font_size * 0.048)), 2)
         lane_step = max(28, int(round(computed_font_size * 2.15)))
@@ -230,8 +230,321 @@ def estimate_line_pixel_width(line, style: SubtitleStyleConfig):
     return round(em_units * float(style.font_size) + 2.0 * float(style.outline), 2)
 
 
+# Compound particles & functional continuations that MUST NEVER be separated from the preceding token
+_INSEPARABLE_CONTINUATION_PREFIXES = (
+    "しては",
+    "しても",
+    "しての",
+    "して",
+    "した",
+    "する",
+    "ついては",
+    "ついても",
+    "ついて",
+    "関しては",
+    "関して",
+    "よっては",
+    "よって",
+    "よる",
+    "おいては",
+    "おいて",
+    "おける",
+    "とっては",
+    "とって",
+    "対しては",
+    "対して",
+    "対する",
+    "ともに",
+    "いった",
+    "いう",
+    "くらい",
+    "ぐらい",
+    "ばかり",
+    "ながら",
+    "つつも",
+    "つつ",
+    "ために",
+    "ため",
+    "ように",
+    "ような",
+    "ようで",
+    "わけでは",
+    "わけです",
+    "わけで",
+    "わけ",
+    "では",
+    "には",
+    "とは",
+    "にも",
+    "でも",
+    "かも",
+    "ても",
+    "たり",
+    "だり",
+    "ので",
+    "のに",
+    "けれども",
+    "けれど",
+    "から",
+    "まで",
+    "より",
+    "ほど",
+    "など",
+    "いませんよね",
+    "いません",
+    "ません",
+    "ました",
+    "ている",
+    "ていた",
+    "ていく",
+    "てくる",
+    "ていったんだ",
+    "て言ったんだ",
+    "ていった",
+    "て言った",
+    "られる",
+    "される",
+    "された",
+    "されて",
+    "なりますが",
+    "なります",
+    "なった",
+    "なる",
+    "ない",
+    "なかった",
+    "んです",
+    "んだ",
+    "よね",
+    "ね",
+    "よ",
+    "か",
+    "し",
+    "て",
+    "で",
+    "は",
+    "が",
+    "を",
+    "に",
+    "と",
+    "へ",
+    "も",
+    "や",
+    "の",
+)
+
+
+# Verbal-noun (連用形名詞) stems that form compound nouns with immediately following Kanji (e.g. `組み立て作業`, `割り当て結果`, `引き伸ばし防止`)
+_COMPOUND_VERBAL_NOUN_PREFIXES = (
+    "組み立て",
+    "割り当て",
+    "引き伸ばし",
+    "切り抜き",
+    "吹き替え",
+    "切り替え",
+    "組み合わせ",
+    "取り組み",
+    "立ち上げ",
+    "受け入れ",
+    "聞き取り",
+    "書き起こし",
+    "読み上げ",
+    "打ち合わせ",
+    "積み重ね",
+)
+
+
+def _is_prohibited_split_position(text: str, pos: int) -> bool:
+    """Return True if splitting `text` at index `pos` (`text[:pos]` / `text[pos:]`) breaks a bunsetsu,
+    compound particle (like `として`), compound verbal-noun (`組み立て作業`), English/numeric token, or punctuation.
+    """
+    if pos <= 0 or pos >= len(text):
+        return True
+    left = text[:pos]
+    right = text[pos:]
+    prev_c = left[-1]
+    next_c = right[0]
+
+    # 1. Never break inside ASCII words/numbers
+    if prev_c.isascii() and prev_c.isalnum() and next_c.isascii() and next_c.isalnum():
+        return True
+    # 2. Never start a new line with closing punctuation, particles, or small kana
+    if next_c in "、。，．！？!?」』）)]｝・ーぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ":
+        return True
+    # 3. Never end a line with opening brackets
+    if prev_c in "「『（([｛":
+        return True
+    # 4. Never split compound verbal-noun + Kanji compounds (e.g. `組み立て作業`, `割り当て検証`)
+    if "\u4e00" <= next_c <= "\u9fff":
+        for vn in _COMPOUND_VERBAL_NOUN_PREFIXES:
+            if left.endswith(vn):
+                return True
+    # 5. Never split compound particles or auxiliary verb chains (e.g. `ロボットと / して`)
+    right_stripped = right.lstrip(" ")
+    for prefix in _INSEPARABLE_CONTINUATION_PREFIXES:
+        if right_stripped.startswith(prefix):
+            if prev_c in " 、。！？!?" and prefix in ("でも", "から", "ので", "のに", "けれど", "けれども", "して"):
+                if prefix != "して":
+                    return False
+            return True
+    # 6. Never split inside contiguous Katakana words (e.g. `エンドエフェクター`, `ソフトウェア`, `ロボット`)
+    if ("ァ" <= prev_c <= "ヺ" or prev_c == "ー") and ("ァ" <= next_c <= "ヺ" or next_c == "ー"):
+        return True
+    # 7. Never split inside contiguous Kanji compounds unless separated by particle/punctuation
+    if ("\u4e00" <= prev_c <= "\u9fff") and ("\u4e00" <= next_c <= "\u9fff"):
+        return True
+    # 8. Never split between a Kanji/Katakana/ASCII noun and an immediately following particle
+    if (
+        ("\u4e00" <= prev_c <= "\u9fff")
+        or ("ァ" <= prev_c <= "ヺ" or prev_c == "ー")
+        or (prev_c.isascii() and prev_c.isalnum())
+    ) and ("ぁ" <= next_c <= "ん"):
+        return True
+    return False
+
+
+def segment_japanese_bunsetsu(text: str, japanese_analysis=None) -> list[str]:
+    """BudouX-style Japanese bunsetsu (phrase) segmenter.
+
+    Uses `budoux` if available in the environment and post-processes with compound-particle
+    and technical-term merging rules so phrases like `ロボットとして`, `デジタルAIと`,
+    `人型ロボットの`, and `大規模AIモデルに` are never split mid-phrase.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    # 1. If morphological tokens are provided and match the text, group them into bunsetsu
+    tokens = (japanese_analysis or {}).get("tokens")
+    if isinstance(tokens, list) and tokens and all(isinstance(t, dict) and "surface" in t for t in tokens):
+        reconstructed = "".join(t["surface"] for t in tokens)
+        if _normalize_for_comparison(reconstructed) == _normalize_for_comparison(raw):
+            raw_pieces = [t["surface"] for t in tokens if t.get("surface")]
+            merged = []
+            for piece in raw_pieces:
+                if merged and _is_prohibited_split_position(merged[-1] + piece, len(merged[-1])):
+                    merged[-1] += piece
+                else:
+                    merged.append(piece)
+            return merged
+
+    # 2. Try BudouX if installed in environment
+    initial_chunks = None
+    try:
+        import budoux  # type: ignore
+
+        parser = budoux.load_default_japanese_parser()
+        initial_chunks = [c for c in parser.parse(raw) if c]
+    except Exception:
+        initial_chunks = None
+
+    # 3. Built-in BudouX-style character-transition & particle-boundary bunsetsu segmenter
+    if not initial_chunks:
+        initial_chunks = []
+        cur = ""
+        n = len(raw)
+        i = 0
+        while i < n:
+            ch = raw[i]
+            cur += ch
+            i += 1
+            if i >= n:
+                break
+            # Check if `i` is a valid bunsetsu boundary in `raw`
+            prev_c = raw[i - 1]
+            next_c = raw[i]
+            # Always break after punctuation or space
+            if prev_c in CLAUSE_BREAK_CHARS or prev_c == " ":
+                if not _is_prohibited_split_position(raw, i):
+                    initial_chunks.append(cur)
+                    cur = ""
+                continue
+            # Transition from Hiragana (particle/auxiliary tail) to Kanji, Katakana, or ASCII content word
+            is_hira_prev = "ぁ" <= prev_c <= "ん"
+            is_content_next = (
+                ("\u4e00" <= next_c <= "\u9fff")
+                or ("ァ" <= next_c <= "ヺ")
+                or (next_c.isascii() and next_c.isalnum())
+            )
+            if is_hira_prev and is_content_next and not _is_prohibited_split_position(raw, i):
+                initial_chunks.append(cur)
+                cur = ""
+                continue
+            # Transition after particle before common Hiragana lexical starters (`それ`, `これ`, `そこ`, `ここ`, `まだ`, `もう`, `いわば`, `あらゆる`)
+            if prev_c in "はがをにでとへもやのし、 " and not _is_prohibited_split_position(raw, i):
+                rem = raw[i:]
+                if rem.startswith(("それ", "これ", "あれ", "そこ", "ここ", "まだ", "もう", "いわば", "あらゆる", "ほとんど", "だから", "でも", "ただ")):
+                    initial_chunks.append(cur)
+                    cur = ""
+        if cur:
+            initial_chunks.append(cur)
+
+    # 4. Post-merge any chunks that would violate `_is_prohibited_split_position` or leave tiny 1-2 char orphans
+    merged_bunsetsu = []
+    for piece in initial_chunks:
+        if not piece:
+            continue
+        if merged_bunsetsu:
+            combined = merged_bunsetsu[-1] + piece
+            if _is_prohibited_split_position(combined, len(merged_bunsetsu[-1])):
+                merged_bunsetsu[-1] = combined
+                continue
+            if len(merged_bunsetsu[-1].strip()) <= 2 and not any(c in CLAUSE_BREAK_CHARS for c in merged_bunsetsu[-1]):
+                merged_bunsetsu[-1] = combined
+                continue
+        merged_bunsetsu.append(piece)
+
+    if len(merged_bunsetsu) >= 2 and len(merged_bunsetsu[-1].strip()) <= 2:
+        merged_bunsetsu[-2] += merged_bunsetsu[-1]
+        merged_bunsetsu.pop()
+
+    return merged_bunsetsu or [raw]
+
+
+def detect_unnatural_line_breaks(lines_or_cues):
+    """Check whether any line break splits mid-bunsetsu (e.g. `ロボットと / して`).
+
+    If passed `list[str]`, returns `list[dict]`.
+    If passed `list[dict]` (cues), returns `{'passed': bool, 'unnatural_break_count': int, 'violations': list[dict]}`.
+    """
+    items = list(lines_or_cues or [])
+    if items and isinstance(items[0], dict):
+        all_violations = []
+        for cue in items:
+            c_lines = cue.get("display_lines") or cue.get("lines") or []
+            v_list = detect_unnatural_line_breaks(c_lines)
+            for v in v_list:
+                all_violations.append({
+                    "entry_id": cue.get("entry_id", cue.get("id")),
+                    "cue_index": cue.get("cue_index", 0),
+                    **v,
+                })
+        return {
+            "passed": len(all_violations) == 0,
+            "unnatural_break_count": len(all_violations),
+            "violations": all_violations,
+        }
+
+    violations = []
+    for i in range(len(items) - 1):
+        left = str(items[i]).rstrip()
+        right = str(items[i + 1]).lstrip()
+        if not left or not right:
+            continue
+        combined = left + right
+        if _is_prohibited_split_position(combined, len(left)):
+            violations.append({
+                "line_index": i,
+                "left_tail": left[-6:],
+                "right_head": right[:6],
+                "reason": "mid_bunsetsu_or_compound_particle_split",
+            })
+    return violations
+
+
 def prevent_line_overflow(lines, style: SubtitleStyleConfig):
-    """Ensure no subtitle line exceeds `style.max_chars_per_line` or available horizontal pixel width."""
+    """Ensure no subtitle line exceeds `style.max_chars_per_line` or available horizontal pixel width,
+    and never exceeds `style.max_lines` (default 2) while respecting bunsetsu boundaries.
+    """
     usable_width = max(80.0, float(style.play_res_x - style.margin_l - style.margin_r))
     max_chars_by_px = max(6, int(math.floor((usable_width - 2.0 * style.outline) / max(1.0, float(style.font_size)))))
     effective_max_chars = min(int(style.max_chars_per_line), max_chars_by_px)
@@ -241,56 +554,89 @@ def prevent_line_overflow(lines, style: SubtitleStyleConfig):
         clean = str(line).strip()
         if not clean:
             continue
-        while len(clean) > effective_max_chars:
-            # Find natural break point near effective_max_chars or midpoint
-            target = min(effective_max_chars, max(4, len(clean) // 2))
-            split_at = target
-            for offset in range(0, min(6, target - 2)):
-                for cand in (target - offset, min(effective_max_chars, target + offset)):
-                    if 2 <= cand < len(clean):
-                        prev_c = clean[cand - 1]
-                        next_c = clean[cand]
-                        if prev_c.isascii() and prev_c.isalnum() and next_c.isascii() and next_c.isalnum():
-                            continue
-                        if prev_c in " 、。！？はがをにでとへもやの":
+        if len(clean) <= effective_max_chars:
+            safe_lines.append(clean)
+            continue
+        # Split long line at bunsetsu boundaries
+        bunsetsu = segment_japanese_bunsetsu(clean)
+        if len(bunsetsu) >= 2:
+            cur = ""
+            for b in bunsetsu:
+                cand = (cur + b) if not (cur.endswith(" ") or b.startswith(" ")) else (cur + b)
+                if cur and len(cand.strip()) > effective_max_chars:
+                    safe_lines.append(cur.strip())
+                    cur = b.lstrip()
+                else:
+                    cur = cand
+            if cur.strip():
+                safe_lines.append(cur.strip())
+        else:
+            # Fallback if a single token exceeds effective_max_chars
+            while len(clean) > effective_max_chars:
+                target = min(effective_max_chars, max(4, len(clean) // 2))
+                split_at = target
+                for offset in range(0, min(8, target - 2)):
+                    for cand in (target - offset, min(effective_max_chars, target + offset)):
+                        if 2 <= cand < len(clean) and not _is_prohibited_split_position(clean, cand):
                             split_at = cand
                             break
-                if split_at != target:
-                    break
-            safe_lines.append(clean[:split_at].strip())
-            clean = clean[split_at:].strip()
-        if clean:
-            safe_lines.append(clean)
+                    if split_at != target:
+                        break
+                safe_lines.append(clean[:split_at].strip())
+                clean = clean[split_at:].strip()
+            if clean:
+                safe_lines.append(clean)
 
-    # If wrapping exceeded max_lines, rebalance across max_lines if possible
-    if len(safe_lines) > style.max_lines and style.max_lines >= 2:
-        combined = " ".join(safe_lines) if any(" " in s for s in safe_lines) else "".join(safe_lines)
-        if len(combined) <= effective_max_chars * style.max_lines:
-            rebalanced = []
-            rem = combined
-            for i in range(style.max_lines):
-                slots_left = style.max_lines - i
-                if slots_left == 1 or len(rem) <= effective_max_chars:
-                    rebalanced.append(rem.strip())
-                    rem = ""
-                    break
-                cut = min(effective_max_chars, max(1, math.ceil(len(rem) / slots_left)))
-                rebalanced.append(rem[:cut].strip())
-                rem = rem[cut:].strip()
-            if not rem:
-                safe_lines = [s for s in rebalanced if s]
+    # If wrapping produced > style.max_lines, rebalance across style.max_lines using bunsetsu boundaries
+    if len(safe_lines) > style.max_lines and style.max_lines == 2:
+        joined = " ".join(s.strip() for s in safe_lines if s.strip())
+        bunsetsu = segment_japanese_bunsetsu(joined)
+        if len(bunsetsu) >= 2:
+            best_idx = 1
+            best_score = math.inf
+            for idx in range(1, len(bunsetsu)):
+                l_str = "".join(bunsetsu[:idx]).strip()
+                r_str = "".join(bunsetsu[idx:]).strip()
+                ov = max(0, len(l_str) - effective_max_chars) + max(0, len(r_str) - effective_max_chars)
+                penalty = 500 if _is_prohibited_split_position(l_str + r_str, len(l_str)) else 0
+                score = ov * 100 + penalty + abs(len(l_str) - len(r_str))
+                if score < best_score:
+                    best_score = score
+                    best_idx = idx
+            l_final = "".join(bunsetsu[:best_idx]).strip()
+            r_final = "".join(bunsetsu[best_idx:]).strip()
+            if len(l_final) <= effective_max_chars and len(r_final) <= effective_max_chars:
+                return [l_final, r_final]
+
     return safe_lines[: style.max_lines] if len(safe_lines) <= style.max_lines else safe_lines
 
 
 def check_subtitle_overflow(cues, style: SubtitleStyleConfig):
-    """Audit all subtitle cues for character count, pixel width, and vertical margin bounds."""
+    """Audit all subtitle cues for character count, pixel width, max line count (<= 2), and natural bunsetsu breaks."""
     usable_width = max(80.0, float(style.play_res_x - style.margin_l - style.margin_r))
     overflow_cues = []
+    unnatural_break_cues = []
     max_px = 0.0
     max_chars = 0
+    max_line_count = 0
 
     for cue in cues or []:
         disp_lines = cue.get("display_lines") or cue.get("lines") or []
+        max_line_count = max(max_line_count, len(disp_lines))
+        if len(disp_lines) > style.max_lines:
+            overflow_cues.append({
+                "entry_id": cue.get("entry_id", cue.get("id")),
+                "cue_index": cue.get("cue_index", 0),
+                "reason": f"exceeds_max_lines:{len(disp_lines)}>{style.max_lines}",
+                "line_count": len(disp_lines),
+            })
+        break_issues = detect_unnatural_line_breaks(disp_lines)
+        if break_issues:
+            unnatural_break_cues.append({
+                "entry_id": cue.get("entry_id", cue.get("id")),
+                "cue_index": cue.get("cue_index", 0),
+                "issues": break_issues,
+            })
         for l_idx, line in enumerate(disp_lines):
             px = estimate_line_pixel_width(line, style)
             ch_len = len(line)
@@ -311,10 +657,14 @@ def check_subtitle_overflow(cues, style: SubtitleStyleConfig):
     return {
         "overflow_count": len(overflow_cues),
         "overflow_cues": overflow_cues,
+        "unnatural_break_count": len(unnatural_break_cues),
+        "unnatural_break_cues": unnatural_break_cues,
         "max_line_char_count": max_chars,
+        "max_line_count_observed": max_line_count,
         "max_line_pixel_width": round(max_px, 2),
         "available_pixel_width": round(usable_width, 2),
-        "all_lines_within_bounds": len(overflow_cues) == 0,
+        "all_lines_within_bounds": len(overflow_cues) == 0 and max_line_count <= style.max_lines,
+        "all_breaks_natural": len(unnatural_break_cues) == 0,
     }
 
 
@@ -340,105 +690,117 @@ def _normalize_for_comparison(text):
 
 
 def split_japanese_clauses(text, japanese_analysis=None):
-    """Split Japanese text into natural bunsetsu/clause units without losing any characters."""
+    """Split Japanese text into natural bunsetsu/clause units without losing any characters
+    and without breaking compound particles like `として` or technical terms.
+    """
     text = text.strip()
     if not text:
         raise ValueError("Cannot split empty subtitle text.")
+    return segment_japanese_bunsetsu(text, japanese_analysis=japanese_analysis)
 
-    tokens = (japanese_analysis or {}).get("tokens")
-    if isinstance(tokens, list) and tokens and all(isinstance(t, dict) and "surface" in t for t in tokens):
-        reconstructed = "".join(t["surface"] for t in tokens)
-        if _normalize_for_comparison(reconstructed) == _normalize_for_comparison(text):
-            units = []
-            current = ""
-            for tok in tokens:
-                surf = tok["surface"]
-                pos = tok.get("pos") or []
-                current += surf
-                is_punct = any(ch in CLAUSE_BREAK_CHARS for ch in surf)
-                is_particle = (pos and pos[0] == "助詞") or surf in PARTICLE_SURFACES
-                if is_punct or (is_particle and len(current) >= 4):
-                    units.append(current)
-                    current = ""
-            if current:
-                if units and len(current) <= 2:
-                    units[-1] += current
-                else:
-                    units.append(current)
-            return units
 
-    # Regex fallback keeping numbers/English words intact and breaking after punctuation or common particles.
-    pattern = re.compile(
-        r"[0-9A-Za-z.,%]+(?:兆|億|万|千|百|十|回|秒|分|人|個|年|月|日)?|"
-        r"[^。！？!?、，,…\s]+[。！？!?、，,…]*",
-        re.UNICODE,
-    )
-    raw_chunks = [m.group(0) for m in pattern.finditer(text) if m.group(0)]
-    if not raw_chunks:
-        return [text]
-    units = []
-    for chunk in raw_chunks:
-        # Further split long non-punctuated chunks at particle boundaries while keeping >=4 chars per unit.
-        sub_parts = re.split(r"(?<=[はがをにでとへやも])(?![0-9A-Za-z。！？!?、，,…])", chunk)
-        buf = ""
-        for part in sub_parts:
-            if not part:
-                continue
-            if len(buf) + len(part) <= 7:
-                buf += part
-            else:
-                if buf:
-                    units.append(buf)
-                buf = part
-        if buf:
-            units.append(buf)
-    return units or [text]
+def _format_len(text: str) -> int:
+    """Measure effective display length of a Japanese string after period removal and comma->space formatting."""
+    s = str(text or "").replace("。", "")
+    s = re.sub(r"[、，]+\s*", " ", s).strip()
+    return len(s)
+
+
+def _balance_group_into_two_lines(group: list[str], max_chars_per_line: int, max_lines: int = 2) -> list[str]:
+    """Balance a list of bunsetsu units into at most `max_lines` (default 2) lines without breaking any bunsetsu."""
+    joined = "".join(group).strip()
+    if _format_len(joined) <= max_chars_per_line or max_lines == 1:
+        return [joined]
+    if len(group) >= 2:
+        best_idx = 1
+        best_score = math.inf
+        for idx in range(1, len(group)):
+            left = "".join(group[:idx]).strip()
+            right = "".join(group[idx:]).strip()
+            l_len = _format_len(left)
+            r_len = _format_len(right)
+            overflow = max(0, l_len - max_chars_per_line) + max(0, r_len - max_chars_per_line)
+            prohibited_pen = 1000 if _is_prohibited_split_position(left + right, len(left)) else 0
+            # Strongly prefer breaking at clause commas (`、`) when both lines fit within max_chars_per_line
+            comma_bonus = -14 if (left.endswith(("、", "，", " ")) and overflow == 0) else 0
+            attrib_pen = 18 if left.endswith(("的な", "の", "な", "たる", "あらゆる", "いわば")) else 0
+            score = overflow * 100 + prohibited_pen + attrib_pen + abs(l_len - r_len) + comma_bonus
+            if score < best_score:
+                best_score = score
+                best_idx = idx
+        left_s = "".join(group[:best_idx]).strip()
+        right_s = "".join(group[best_idx:]).strip()
+        return [line for line in (left_s, right_s) if line]
+
+    # Single long unit fallback
+    mid = min(max_chars_per_line, max(1, len(joined) // 2))
+    for offset in range(0, min(8, mid - 2)):
+        for cand in (mid - offset, min(max_chars_per_line, mid + offset)):
+            if 2 <= cand < len(joined) and not _is_prohibited_split_position(joined, cand):
+                return [joined[:cand].strip(), joined[cand:].strip()]
+    return [joined[:mid].strip(), joined[mid:].strip()]
 
 
 def wrap_clause_units(units, *, max_chars_per_line=22, max_lines=2):
-    """Group clause units into cue blocks of at most max_lines lines and max_chars_per_line per line."""
+    """Group bunsetsu/clause units into cue blocks where EVERY cue fits in at most `max_lines` (2) lines
+    of `max_chars_per_line` characters, splitting long sentences into multiple cues at natural clause boundaries.
+    """
     max_cue_chars = max_chars_per_line * max_lines
     cue_groups = []
     current_group = []
-    current_len = 0
+
+    def _group_fits_in_cue(grp: list[str]) -> bool:
+        if not grp:
+            return True
+        joined_len = _format_len("".join(grp))
+        if joined_len > max_cue_chars:
+            return False
+        lines = _balance_group_into_two_lines(grp, max_chars_per_line, max_lines=max_lines)
+        return len(lines) <= max_lines and all(_format_len(line) <= max_chars_per_line for line in lines)
 
     for unit in units:
-        u_len = len(unit)
-        if current_group and (current_len + u_len > max_cue_chars or re.search(r"[。！？!?]$", current_group[-1])):
+        if not unit:
+            continue
+        if current_group and (
+            not _group_fits_in_cue([*current_group, unit])
+            or re.search(r"[。！？!?]$", current_group[-1])
+        ):
             cue_groups.append(current_group)
             current_group = [unit]
-            current_len = u_len
         else:
             current_group.append(unit)
-            current_len += u_len
     if current_group:
         cue_groups.append(current_group)
+
+    # Rebalance adjacent cue groups at clause boundaries (`、`, `つつ`, `で、`, `が、`)
+    if len(cue_groups) == 2:
+        all_units = [u for g in cue_groups for u in g]
+        if not re.search(r"[。！？!?]$", cue_groups[0][-1]):
+            best_k = None
+            best_sc = math.inf
+            for k in range(1, len(all_units)):
+                g1 = all_units[:k]
+                g2 = all_units[k:]
+                if _group_fits_in_cue(g1) and _group_fits_in_cue(g2):
+                    w1 = _format_len("".join(g1))
+                    w2 = _format_len("".join(g2))
+                    last_u = g1[-1]
+                    clause_bonus = -18 if last_u.endswith(("、", "，", "が、", "て、", "で、", "し、", "つつ", "ながら")) else 0
+                    attrib_pen = 35 if last_u.endswith(("的な", "の", "な", "や", "と")) else 0
+                    sc = abs(w1 - w2) + clause_bonus + attrib_pen
+                    if sc < best_sc:
+                        best_sc = sc
+                        best_k = k
+            if best_k is not None:
+                cue_groups = [all_units[:best_k], all_units[best_k:]]
 
     formatted_cues = []
     for group in cue_groups:
         joined = "".join(group).strip()
-        if len(joined) <= max_chars_per_line or max_lines == 1:
-            lines = [joined]
-        elif len(group) >= 2:
-            # Choose clause split point that best balances the two lines.
-            best_idx = 1
-            best_score = math.inf
-            for idx in range(1, len(group)):
-                left = "".join(group[:idx]).strip()
-                right = "".join(group[idx:]).strip()
-                overflow = max(0, len(left) - max_chars_per_line) + max(0, len(right) - max_chars_per_line)
-                score = overflow * 100 + abs(len(left) - len(right))
-                if score < best_score:
-                    best_score = score
-                    best_idx = idx
-            lines = ["".join(group[:best_idx]).strip(), "".join(group[best_idx:]).strip()]
-        else:
-            mid = min(max_chars_per_line, max(1, len(joined) // 2))
-            lines = [joined[:mid].strip(), joined[mid:].strip()]
-        lines = [line for line in lines if line]
+        lines = _balance_group_into_two_lines(group, max_chars_per_line, max_lines=max_lines)
         formatted_cues.append({
             "text": "".join(lines),
-            "lines": lines[:max_lines] if len(lines) <= max_lines else lines,
+            "lines": lines[:max_lines],
             "weight": max(1, count_mora(joined) or len(joined)),
         })
     return formatted_cues
@@ -446,14 +808,14 @@ def wrap_clause_units(units, *, max_chars_per_line=22, max_lines=2):
 
 def _attach_display_formatting(cue, style: SubtitleStyleConfig):
     """Attach punctuation-formatted, overflow-protected `display_lines` and `display_text_ja` while keeping `text_ja` intact."""
-    raw_lines = prevent_line_overflow(cue.get("lines") or [cue["text_ja"]], style)
+    initial_lines = list(cue.get("lines") or [cue["text_ja"]])
     disp_lines = format_subtitle_display_lines(
-        raw_lines,
+        initial_lines,
         strip_periods=style.strip_periods,
         comma_mode=style.comma_mode,
     )
     disp_lines = prevent_line_overflow(disp_lines, style)
-    cue["lines"] = raw_lines
+    cue["lines"] = initial_lines
     cue["display_lines"] = disp_lines
     cue["display_text_ja"] = "\n".join(disp_lines)
     return cue

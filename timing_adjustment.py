@@ -1323,3 +1323,458 @@ def detect_and_resolve_clip_boundaries(
         'fade_out_seconds': float(fade_out_seconds),
         'unextended_boundary_warning': bool(has_boundary_cut and not extension_applied),
     }
+
+
+# ============================================================================
+# Phase 13.2: Natural Speaking Rate (Slowdown Prohibited by Default),
+#             Ordered Overlong TTS Resolution, Intra-Speaker Tempo Smoothing &
+#             Time-Stretch Degradation Diagnostics
+# ============================================================================
+
+DEFAULT_NORMAL_ATEMPO = 1.00
+DEFAULT_MAX_ATEMPO_PHASE13_2 = 1.20
+HARD_MAX_ATEMPO_PHASE13_2 = 1.25
+MIN_EXCEPTIONAL_SLOWDOWN_ATEMPO = 0.95
+
+
+def compute_phase13_2_speech_rate_ratio(
+    actual_duration,
+    target_slot_duration,
+    *,
+    available_barrier_duration=None,
+    allow_slowdown=False,
+    min_atempo=1.00,
+    exceptional_min_atempo=MIN_EXCEPTIONAL_SLOWDOWN_ATEMPO,
+    max_atempo=DEFAULT_MAX_ATEMPO_PHASE13_2,
+    hard_max_atempo=HARD_MAX_ATEMPO_PHASE13_2,
+    deadband=0.02,
+):
+    """Phase 13.2 natural speech rate policy:
+    - Normal playback: `1.00x`.
+    - Allowed speedup: default `<= 1.20x`, configurable up to `<= 1.25x` (`hard_max_atempo`).
+    - Automatic slowdown: PROHIBITED by default (`allow_slowdown=False`).
+      When generated Japanese TTS is shorter than `target_slot_duration`, plays at `1.00x`
+      and leaves the remaining duration as a natural pause (`trailing_pause_seconds`).
+    - Exceptional slowdown: only when `allow_slowdown=True`, and strictly clamped to `>= 0.95x`.
+    """
+    for name, val in [
+        ('actual_duration', actual_duration),
+        ('target_slot_duration', target_slot_duration),
+        ('min_atempo', min_atempo),
+        ('max_atempo', max_atempo),
+        ('hard_max_atempo', hard_max_atempo),
+    ]:
+        if type(val) not in (int, float) or not math.isfinite(val) or val <= 0:
+            raise ValueError(f'Invalid {name}: {val}')
+
+    if float(max_atempo) < 1.0 - 1e-6:
+        raise ValueError(f'max_atempo={max_atempo} must be >= 1.0.')
+
+    min_slowdown_floor = max(MIN_EXCEPTIONAL_SLOWDOWN_ATEMPO, float(exceptional_min_atempo))
+    if allow_slowdown:
+        effective_min = min(1.0, max(min_slowdown_floor, float(min_atempo) if float(min_atempo) < 1.0 else min_slowdown_floor))
+    else:
+        effective_min = 1.00
+
+    effective_max = min(float(hard_max_atempo), max(1.00, float(max_atempo)))
+    act_d = float(actual_duration)
+    slot_d = float(target_slot_duration)
+    avail_d = float(available_barrier_duration) if available_barrier_duration is not None else slot_d
+    budget_d = max(0.15, min(slot_d, avail_d) if avail_d < slot_d else avail_d)
+
+    ideal_ratio = act_d / max(0.10, slot_d)
+    barrier_ratio = act_d / budget_d
+
+    if act_d <= budget_d + float(deadband):
+        if allow_slowdown and ideal_ratio < 1.0 - float(deadband):
+            applied = max(effective_min, ideal_ratio)
+            direction = 'exceptional_slowdown' if applied < 0.995 else 'none'
+            if direction == 'none':
+                applied = 1.0
+        else:
+            applied = 1.0
+            direction = 'none'
+        exp_dur = act_d / applied
+        trailing_pause = max(0.0, slot_d - exp_dur)
+        return {
+            'applied_atempo': round(applied, 4),
+            'ideal_atempo': round(ideal_ratio, 4),
+            'barrier_atempo': round(barrier_ratio, 4),
+            'direction': direction,
+            'slowdown_applied': bool(applied < 0.999),
+            'slowdown_prohibited_by_default': not bool(allow_slowdown),
+            'preserved_natural_speed_with_pause': bool(act_d < slot_d and applied == 1.0),
+            'trailing_pause_seconds': round(trailing_pause, 4),
+            'natural_trailing_pause_seconds': round(trailing_pause, 4),
+            'expected_duration_seconds': round(exp_dur, 4),
+            'clamped': bool(allow_slowdown and ideal_ratio < effective_min),
+            'exceeds_max_speedup': False,
+            'exceeded_max_atempo': False,
+            'requires_structural_resolution': False,
+        }
+
+    # TTS is longer than budget_d -> apply bounded speedup within [1.0, effective_max]
+    applied = min(effective_max, max(1.0, barrier_ratio))
+    if abs(applied - 1.0) <= 0.01:
+        applied = 1.0
+        direction = 'none'
+    else:
+        direction = 'speedup'
+    exp_dur = act_d / applied
+    still_overflows = bool(exp_dur > budget_d + 0.03 or barrier_ratio > effective_max + 1e-4)
+    trailing_p = round(max(0.0, slot_d - exp_dur), 4)
+    return {
+        'applied_atempo': round(applied, 4),
+        'ideal_atempo': round(ideal_ratio, 4),
+        'barrier_atempo': round(barrier_ratio, 4),
+        'direction': direction,
+        'slowdown_applied': False,
+        'slowdown_prohibited_by_default': not bool(allow_slowdown),
+        'preserved_natural_speed_with_pause': False,
+        'trailing_pause_seconds': trailing_p,
+        'natural_trailing_pause_seconds': trailing_p,
+        'expected_duration_seconds': round(exp_dur, 4),
+        'clamped': bool(barrier_ratio > effective_max + 1e-4),
+        'exceeds_max_speedup': still_overflows,
+        'exceeded_max_atempo': still_overflows,
+        'requires_structural_resolution': still_overflows,
+    }
+
+
+def plan_overlong_tts_resolution(
+    entry,
+    *,
+    actual_tts_duration=None,
+    raw_tts_duration=None,
+    trimmed_tts_duration=None,
+    slot_duration=1.0,
+    available_window_duration=None,
+    downstream_pause_seconds=0.0,
+    max_atempo=DEFAULT_MAX_ATEMPO_PHASE13_2,
+    max_timing_shift=0.8,
+    max_shift_seconds=None,
+):
+    """Execute Requirement 2.3 ordered resolution when Japanese TTS exceeds its utterance window."""
+    text_ja = str(entry.get('text_ja', entry.get('translated_text', entry.get('translated', ''))) or '').strip()
+    act_d = float(
+        trimmed_tts_duration
+        if trimmed_tts_duration is not None
+        else (actual_tts_duration if actual_tts_duration is not None else (raw_tts_duration if raw_tts_duration is not None else slot_duration))
+    )
+    slot_d = max(0.15, float(slot_duration))
+    avail_d = (
+        max(slot_d, float(available_window_duration))
+        if available_window_duration is not None
+        else slot_d + max(0.0, min(0.45, float(downstream_pause_seconds or 0.0)))
+    )
+    eff_max_shift = float(max_shift_seconds if max_shift_seconds is not None else max_timing_shift)
+    steps_executed = []
+
+    # Step 1: Inspect translation redundancy
+    mora_count = int(entry.get('mora_count') or _estimate_unit_mora_weight(text_ja))
+    empirical_mps = mora_count / max(0.1, act_d)
+    target_mora_at_1x = max(1, int(math.floor(avail_d * empirical_mps)))
+    target_mora_at_max = max(1, int(math.floor(avail_d * float(max_atempo) * empirical_mps)))
+    is_overlong_at_1x = act_d > avail_d + 0.03
+    steps_executed.append({
+        'step': 1,
+        'action': 'inspect_translation_redundancy',
+        'mora_count': mora_count,
+        'target_mora_at_1x': target_mora_at_1x,
+        'target_mora_at_max_atempo': target_mora_at_max,
+        'is_overlong_at_1x': is_overlong_at_1x,
+    })
+
+    # Step 2 & 3: Meaning-preserving concise rewrite + TTS regeneration recommendation
+    rewrite_res = concise_rewrite_for_timing_budget(text_ja, target_mora_budget=target_mora_at_1x)
+    estimated_rewritten_duration = act_d
+    if rewrite_res['changed'] and mora_count > 0:
+        estimated_rewritten_duration = round(
+            act_d * (float(rewrite_res['rewritten_mora_count']) / float(mora_count)),
+            4,
+        )
+    steps_executed.append({
+        'step': 2,
+        'action': 'concise_meaning_preserving_translation',
+        'changed': rewrite_res['changed'],
+        'original_text_ja': text_ja,
+        'rewritten_text_ja': rewrite_res['rewritten_text_ja'],
+        'original_mora_count': rewrite_res['original_mora_count'],
+        'rewritten_mora_count': rewrite_res['rewritten_mora_count'],
+    })
+    steps_executed.append({
+        'step': 3,
+        'action': 'regenerate_natural_tts',
+        'recommended': bool(is_overlong_at_1x and rewrite_res['changed']),
+        'estimated_duration_after_regeneration_seconds': estimated_rewritten_duration,
+    })
+
+    # Step 4: Bounded speedup within [1.0, max_atempo]
+    rate_res = compute_phase13_2_speech_rate_ratio(
+        estimated_rewritten_duration,
+        slot_d,
+        available_barrier_duration=avail_d,
+        allow_slowdown=False,
+        max_atempo=max_atempo,
+    )
+    dur_after_atempo = float(rate_res['expected_duration_seconds'])
+    steps_executed.append({
+        'step': 4,
+        'action': 'bounded_speedup',
+        'applied_atempo': rate_res['applied_atempo'],
+        'duration_after_atempo_seconds': dur_after_atempo,
+    })
+
+    # Step 5: Safe placement micro-adjustment
+    overflow_after_atempo = max(0.0, dur_after_atempo - avail_d)
+    applied_micro_shift = round(min(overflow_after_atempo, max(0.0, eff_max_shift)), 4)
+    residual_overflow = round(max(0.0, overflow_after_atempo - applied_micro_shift), 4)
+    steps_executed.append({
+        'step': 5,
+        'action': 'safe_placement_micro_adjustment',
+        'applied_shift_seconds': applied_micro_shift,
+        'residual_overflow_seconds': residual_overflow,
+    })
+
+    # Step 6: Quality warning if still unresolved
+    quality_warning = None
+    if residual_overflow > 0.03:
+        quality_warning = (
+            f"Utterance {entry.get('id', entry.get('utterance_id'))} still exceeds available window by "
+            f"{residual_overflow:.2f}s after concise rewrite, {rate_res['applied_atempo']:.2f}x speedup, "
+            f"and {applied_micro_shift:.2f}s shift."
+        )
+    steps_executed.append({
+        'step': 6,
+        'action': 'quality_warning_check',
+        'warning_emitted': quality_warning is not None,
+        'warning': quality_warning,
+    })
+
+    return {
+        'utterance_id': entry.get('id', entry.get('utterance_id')),
+        'is_overlong': is_overlong_at_1x,
+        'steps_executed': steps_executed,
+        'rewrite_result': rewrite_res,
+        'rate_adjustment': rate_res,
+        'applied_micro_shift_seconds': applied_micro_shift,
+        'residual_overflow_seconds': residual_overflow,
+        'quality_warning': quality_warning,
+    }
+
+
+def smooth_intra_speaker_speaking_rates(
+    entries,
+    *,
+    max_adjacent_atempo_jump=0.12,
+    max_adjacent_delta=None,
+    max_atempo=DEFAULT_MAX_ATEMPO_PHASE13_2,
+    allow_slowdown=False,
+):
+    """Detect and smooth abrupt speaking-rate changes across adjacent utterances of the same speaker,
+    while respecting intentional source speaker pace changes.
+    """
+    eff_jump = float(max_adjacent_delta if max_adjacent_delta is not None else max_adjacent_atempo_jump)
+    working_entries = [dict(e) for e in (entries or [])]
+    by_speaker = {}
+    for idx, e in enumerate(working_entries):
+        spk = e.get('speaker')
+        if spk:
+            by_speaker.setdefault(spk, []).append((idx, e))
+
+    anomalies = []
+    smoothed_adjustments = []
+
+    for spk, indexed_rows in sorted(by_speaker.items()):
+        for k in range(len(indexed_rows) - 1):
+            idx_a, a = indexed_rows[k]
+            idx_b, b = indexed_rows[k + 1]
+            atempo_a = float(a.get('applied_atempo', 1.0))
+            atempo_b = float(b.get('applied_atempo', 1.0))
+            jump = abs(atempo_b - atempo_a)
+
+            en_words_a = len(str(a.get('text_en', a.get('original_text', ''))).split())
+            en_words_b = len(str(b.get('text_en', b.get('original_text', ''))).split())
+            src_dur_a = max(0.3, float(a.get('slot_duration', a.get('end', 1.0) - a.get('start', 0.0))))
+            src_dur_b = max(0.3, float(b.get('slot_duration', b.get('end', 1.0) - b.get('start', 0.0))))
+            en_wps_a = en_words_a / src_dur_a
+            en_wps_b = en_words_b / src_dur_b
+            source_rate_ratio = max(en_wps_a, en_wps_b) / max(0.5, min(en_wps_a, en_wps_b))
+            intentional_source_change = bool(en_words_a > 0 and en_words_b > 0 and source_rate_ratio >= 1.45)
+
+            if jump > eff_jump and not intentional_source_change:
+                anomalies.append({
+                    'speaker': spk,
+                    'first_id': a.get('id', a.get('utterance_id')),
+                    'second_id': b.get('id', b.get('utterance_id')),
+                    'first_atempo': round(atempo_a, 4),
+                    'second_atempo': round(atempo_b, 4),
+                    'atempo_jump': round(jump, 4),
+                    'intentional_source_change': False,
+                })
+                if atempo_a > atempo_b + eff_jump:
+                    new_a = round(min(float(max_atempo), atempo_b + eff_jump), 4)
+                    smoothed_adjustments.append({
+                        'utterance_id': a.get('id', a.get('utterance_id')),
+                        'old_atempo': round(atempo_a, 4),
+                        'smoothed_atempo': new_a,
+                    })
+                    a['smoothed_atempo'] = new_a
+                    a['applied_atempo'] = new_a
+                elif atempo_b > atempo_a + eff_jump:
+                    new_b = round(min(float(max_atempo), atempo_a + eff_jump), 4)
+                    smoothed_adjustments.append({
+                        'utterance_id': b.get('id', b.get('utterance_id')),
+                        'old_atempo': round(atempo_b, 4),
+                        'smoothed_atempo': new_b,
+                    })
+                    b['smoothed_atempo'] = new_b
+                    b['applied_atempo'] = new_b
+
+    return {
+        'max_adjacent_atempo_jump_allowed': eff_jump,
+        'detected_rate_jump_anomalies': anomalies,
+        'smoothed_adjustments': smoothed_adjustments,
+        'entries': working_entries,
+        'tempo_consistent': len(anomalies) == 0,
+    }
+
+
+def build_timing_quality_report(
+    utterance_diagnostic_rows,
+    *,
+    placements_map=None,
+    duration_adjustments=None,
+    allow_slowdown=False,
+    max_atempo=DEFAULT_MAX_ATEMPO_PHASE13_2,
+    final_mixed_audio_path=None,
+):
+    """Build Requirement 2.1 & 5 `timing_quality_report.json` recording per-utterance raw vs processed WAVs,
+    slot durations, `atempo` ratios, resampling counts, trim/concat operations, and degradation root causes.
+    """
+    from pathlib import Path
+    from voice_consistency import _read_mono_wav_float32, compute_acoustic_speaker_embedding
+
+    p_map = dict(placements_map or {})
+    records = []
+    slowdown_violations = []
+    speedup_violations = []
+    total_anomalies = 0
+
+    for row in utterance_diagnostic_rows or []:
+        uid = row.get('id', row.get('utterance_id'))
+        p_info = p_map.get(str(uid)) or p_map.get(uid) or {}
+        merged = {**row, **p_info}
+        spk = merged.get('speaker', merged.get('speaker_id'))
+        raw_wav = merged.get('raw_tts_wav_path') or merged.get('raw_audio_file') or merged.get('original_audio_file') or merged.get('audio_file')
+        proc_wav = merged.get('processed_wav_path') or merged.get('active_audio_file') or merged.get('audio_file')
+        slot_dur = float(merged.get('slot_duration_seconds', merged.get('slot_duration', merged.get('source_slot_duration_seconds', 1.0))))
+        raw_dur = float(merged.get('raw_tts_duration_seconds', merged.get('original_duration_seconds', merged.get('actual_tts_duration_seconds', merged.get('actual_duration', 1.0)))))
+        proc_dur = float(merged.get('processed_tts_duration_seconds', merged.get('actual_tts_duration_seconds', merged.get('actual_duration', raw_dur))))
+        atempo_val = float(merged.get('applied_atempo', 1.0))
+        resampling_count = int(merged.get('resampling_count', 1 if abs(atempo_val - 1.0) > 0.01 else 0))
+
+        raw_ac = compute_acoustic_speaker_embedding(raw_wav) if (raw_wav and Path(raw_wav).is_file()) else {}
+        proc_ac = compute_acoustic_speaker_embedding(proc_wav) if (proc_wav and Path(proc_wav).is_file()) else raw_ac
+
+        issues = []
+        if not allow_slowdown and atempo_val < 0.999:
+            slowdown_violations.append({'utterance_id': uid, 'applied_atempo': atempo_val})
+            issues.append(f'slowdown_prohibited:{atempo_val:.3f}')
+        if atempo_val > float(max_atempo) + 0.001:
+            speedup_violations.append({'utterance_id': uid, 'applied_atempo': atempo_val, 'max_atempo': max_atempo})
+            issues.append(f'exceeded_max_atempo:{atempo_val:.3f}')
+        if resampling_count > 1:
+            issues.append(f'excessive_resampling:{resampling_count}')
+
+        raw_warble = float(raw_ac.get('warble_modulation_index', 0.0))
+        proc_warble = float(proc_ac.get('warble_modulation_index', 0.0))
+        proc_clicks = int(proc_ac.get('click_noise_count', 0))
+        if proc_clicks > 0:
+            issues.append(f'click_noise_detected:{proc_clicks}')
+
+        # Check tail truncation (non-zero high amplitude at very end of WAV)
+        tail_truncated = False
+        if proc_wav and Path(proc_wav).is_file():
+            try:
+                p_samples, p_sr = _read_mono_wav_float32(proc_wav)
+                tail_win = min(len(p_samples), max(8, int(round(0.008 * p_sr))))
+                tail_rms = float(np.sqrt(np.mean(p_samples[-tail_win:] ** 2)))
+                if tail_rms > 0.12:
+                    tail_truncated = True
+                    issues.append(f'abrupt_tail_truncation:rms={tail_rms:.3f}')
+            except Exception:
+                pass
+
+        if atempo_val < 0.98 and proc_warble > raw_warble + 0.12:
+            degradation_cause = 'time_stretch_slowdown_warble'
+        elif atempo_val > 1.25:
+            degradation_cause = 'excessive_time_stretch_speedup'
+        elif raw_warble > 0.72:
+            degradation_cause = 'raw_tts_generation_instability'
+        elif proc_clicks > int(raw_ac.get('click_noise_count', 0)) + 2 or tail_truncated:
+            degradation_cause = 'post_processing_trim_or_concat_click'
+        else:
+            degradation_cause = 'none'
+
+        if issues:
+            total_anomalies += 1
+
+        records.append({
+            'utterance_id': uid,
+            'speaker_id': spk,
+            'raw_tts_wav_path': str(raw_wav) if raw_wav else None,
+            'processed_wav_path': str(proc_wav) if proc_wav else None,
+            'final_mixed_audio_path': str(final_mixed_audio_path) if final_mixed_audio_path else merged.get('final_mixed_audio_path'),
+            'source_slot_duration_seconds': round(slot_dur, 4),
+            'raw_tts_duration_seconds': round(raw_dur, 4),
+            'processed_tts_duration_seconds': round(proc_dur, 4),
+            'applied_atempo_ratio': round(atempo_val, 4),
+            'resampling_count': resampling_count,
+            'trim_and_concat_operations': merged.get('trim_and_concat_operations', {
+                'silence_trimmed': bool(merged.get('trim_applied', merged.get('silence_trimmed', False))),
+                'trimmed_seconds': round(max(0.0, raw_dur - proc_dur) if abs(atempo_val - 1.0) < 1e-4 else 0.0, 4),
+            }),
+            'raw_warble_modulation_index': raw_warble,
+            'processed_warble_modulation_index': proc_warble,
+            'onset_distortion_score': float(proc_ac.get('onset_distortion_score', 0.0)),
+            'click_noise_count': proc_clicks,
+            'clipped_sample_count': int(proc_ac.get('clipped_sample_count', 0)),
+            'tail_truncated': tail_truncated,
+            'degradation_cause': degradation_cause,
+            'issues': issues,
+        })
+
+    tempo_smoothing = smooth_intra_speaker_speaking_rates(
+        [
+            {
+                'id': r['utterance_id'],
+                'speaker': r['speaker_id'],
+                'applied_atempo': r['applied_atempo_ratio'],
+                'slot_duration': r['source_slot_duration_seconds'],
+            }
+            for r in records
+        ],
+        max_atempo=max_atempo,
+    )
+
+    return {
+        'kind': 'timing_quality_report',
+        'format_version': 1,
+        'policy': {
+            'normal_atempo': DEFAULT_NORMAL_ATEMPO,
+            'default_max_atempo': DEFAULT_MAX_ATEMPO_PHASE13_2,
+            'hard_max_atempo': HARD_MAX_ATEMPO_PHASE13_2,
+            'allow_slowdown': bool(allow_slowdown),
+            'min_exceptional_slowdown_atempo': MIN_EXCEPTIONAL_SLOWDOWN_ATEMPO,
+        },
+        'utterance_count': len(records),
+        'anomaly_count': total_anomalies,
+        'slowdown_violation_count': len(slowdown_violations),
+        'speedup_violation_count': len(speedup_violations),
+        'slowdown_violations': slowdown_violations,
+        'speedup_violations': speedup_violations,
+        'intra_speaker_tempo_consistency': tempo_smoothing,
+        'utterances': records,
+        'all_timing_constraints_satisfied': len(slowdown_violations) == 0 and len(speedup_violations) == 0 and total_anomalies == 0,
+    }
