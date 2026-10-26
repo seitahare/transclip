@@ -94,19 +94,48 @@ def resolve_input(value, parent, label):
 
 
 # ============================================================================
-# Phase 13: Dynamic Audio Ducking (Voice-Over), Ambient Separation & Loudness
+# Phase 13 / 13.3: Dynamic Audio Ducking (Voice-Over), Hold Control,
+#                  Ambient Separation & ITU-R BS.1770-4 LUFS Normalization
 # ============================================================================
 
-def merge_speech_intervals(intervals, *, total_duration_seconds=None, pre_duck_seconds=0.06,
-                          post_duck_seconds=0.08, min_unspoken_gap_seconds=0.35):
-    """Normalize and merge active Japanese TTS speech intervals, bridging micro-gaps."""
+DEFAULT_DUCK_HOLD_SECONDS = 3.2
+DEFAULT_SAME_SPEAKER_HOLD_SECONDS = 4.0
+DEFAULT_TARGET_LUFS = -16.0
+
+
+def apply_ducking_hold_control(
+    intervals,
+    *,
+    total_duration_seconds=None,
+    pre_duck_seconds=0.06,
+    post_duck_seconds=0.08,
+    min_unspoken_gap_seconds=0.35,
+    hold_seconds=DEFAULT_DUCK_HOLD_SECONDS,
+    same_speaker_hold_seconds=DEFAULT_SAME_SPEAKER_HOLD_SECONDS,
+):
+    """Normalize and merge active Japanese TTS speech intervals with Phase 13.3 Ducking Hold Control.
+
+    Bridges inter-utterance gaps and maintains the ducked state when:
+      1. The gap to the next TTS start is <= `hold_seconds` (default 3.2s, covering 3-4s gaps), OR
+      2. Consecutive utterances belong to the same speaker (`speaker_a == speaker_b`) and the gap is
+         <= `same_speaker_hold_seconds` (default 4.0s).
+    Returns `{"merged_windows": [...], "raw_windows": [...], "held_gaps": [...]}`.
+    """
     cleaned = []
-    for item in intervals or []:
+    for idx, item in enumerate(intervals or []):
+        spk = None
+        uid = None
         if isinstance(item, dict):
             a = float(item.get("start", item.get("placement_seconds", item.get("clip_relative_start_seconds", 0.0))))
             b = float(item.get("end", a + float(item.get("duration", item.get("actual_tts_duration_seconds", 0.0)))))
+            spk = item.get("speaker")
+            uid = item.get("id", item.get("utterance_id", idx))
         else:
             a, b = float(item[0]), float(item[1])
+            if len(item) >= 3:
+                spk = item[2]
+            if len(item) >= 4:
+                uid = item[3]
         if not (math.isfinite(a) and math.isfinite(b)) or b <= a:
             continue
         expanded_a = max(0.0, a - max(0.0, float(pre_duck_seconds)))
@@ -115,20 +144,93 @@ def merge_speech_intervals(intervals, *, total_duration_seconds=None, pre_duck_s
             expanded_a = min(float(total_duration_seconds), expanded_a)
             expanded_b = min(float(total_duration_seconds), expanded_b)
         if expanded_b > expanded_a:
-            cleaned.append((expanded_a, expanded_b))
+            cleaned.append({
+                "start": expanded_a,
+                "end": expanded_b,
+                "raw_start": a,
+                "raw_end": b,
+                "speaker": str(spk).strip() if spk not in (None, "") else None,
+                "id": uid,
+            })
 
     if not cleaned:
-        return []
-    cleaned.sort(key=lambda x: (x[0], x[1]))
-    merged = [cleaned[0]]
-    bridge = max(0.0, float(min_unspoken_gap_seconds))
-    for a, b in cleaned[1:]:
-        prev_a, prev_b = merged[-1]
-        if a - prev_b <= bridge + 1e-6:
-            merged[-1] = (prev_a, max(prev_b, b))
+        return {"merged_windows": [], "raw_windows": [], "held_gaps": []}
+
+    cleaned.sort(key=lambda x: (x["start"], x["end"]))
+    base_bridge = max(0.0, float(min_unspoken_gap_seconds or 0.0))
+    general_hold = max(base_bridge, float(hold_seconds)) if hold_seconds is not None else base_bridge
+    same_spk_hold = (
+        max(general_hold, float(same_speaker_hold_seconds))
+        if same_speaker_hold_seconds is not None
+        else general_hold
+    )
+
+    merged = [[cleaned[0]["start"], cleaned[0]["end"], cleaned[0]["speaker"], cleaned[0]["id"], cleaned[0]["raw_end"]]]
+    held_gaps = []
+
+    for cur in cleaned[1:]:
+        prev_a, prev_b, prev_spk, prev_id, prev_raw_end = merged[-1]
+        raw_gap = max(0.0, cur["raw_start"] - prev_raw_end)
+        exp_gap = cur["start"] - prev_b
+        is_same_spk = bool(prev_spk and cur["speaker"] and prev_spk == cur["speaker"])
+
+        if hold_seconds is not None:
+            eff_bridge = same_spk_hold if is_same_spk else general_hold
+        elif is_same_spk and same_speaker_hold_seconds is not None:
+            eff_bridge = float(same_speaker_hold_seconds)
         else:
-            merged.append((a, b))
-    return [(round(a, 6), round(b, 6)) for a, b in merged]
+            eff_bridge = base_bridge
+
+        if exp_gap <= eff_bridge + 1e-6 or raw_gap <= eff_bridge + 1e-6:
+            if raw_gap > base_bridge + 1e-6:
+                reason = "same_speaker_continuous_hold" if is_same_spk else "short_gap_hold_within_threshold"
+                held_gaps.append({
+                    "prev_id": prev_id,
+                    "next_id": cur["id"],
+                    "prev_speaker": prev_spk,
+                    "next_speaker": cur["speaker"],
+                    "same_speaker": is_same_spk,
+                    "gap_start_seconds": round(prev_raw_end, 4),
+                    "gap_end_seconds": round(cur["raw_start"], 4),
+                    "gap_duration_seconds": round(raw_gap, 4),
+                    "hold_threshold_seconds": round(eff_bridge, 4),
+                    "reason": reason,
+                })
+            merged[-1][1] = max(prev_b, cur["end"])
+            merged[-1][2] = cur["speaker"] or prev_spk
+            merged[-1][3] = cur["id"]
+            merged[-1][4] = max(prev_raw_end, cur["raw_end"])
+        else:
+            merged.append([cur["start"], cur["end"], cur["speaker"], cur["id"], cur["raw_end"]])
+
+    return {
+        "merged_windows": [(round(m[0], 6), round(m[1], 6)) for m in merged],
+        "raw_windows": [(round(c["raw_start"], 6), round(c["raw_end"], 6)) for c in cleaned],
+        "held_gaps": held_gaps,
+    }
+
+
+def merge_speech_intervals(
+    intervals,
+    *,
+    total_duration_seconds=None,
+    pre_duck_seconds=0.06,
+    post_duck_seconds=0.08,
+    min_unspoken_gap_seconds=0.35,
+    hold_seconds=None,
+    same_speaker_hold_seconds=None,
+):
+    """Normalize and merge active Japanese TTS speech intervals, bridging micro-gaps and optional hold windows."""
+    res = apply_ducking_hold_control(
+        intervals,
+        total_duration_seconds=total_duration_seconds,
+        pre_duck_seconds=pre_duck_seconds,
+        post_duck_seconds=post_duck_seconds,
+        min_unspoken_gap_seconds=min_unspoken_gap_seconds,
+        hold_seconds=hold_seconds,
+        same_speaker_hold_seconds=same_speaker_hold_seconds,
+    )
+    return res["merged_windows"]
 
 
 def build_ducking_envelope(
@@ -145,20 +247,23 @@ def build_ducking_envelope(
     pre_duck_seconds=0.06,
     post_duck_seconds=0.08,
     min_unspoken_gap_seconds=0.35,
+    hold_seconds=None,
+    same_speaker_hold_seconds=None,
+    hold_gap_gain=None,
     curve="cosine",
     ducking_style="dynamic",
 ):
-    """Build a sample-accurate 1D gain envelope for voice-over ducking.
+    """Build a sample-accurate 1D gain envelope for voice-over ducking with Phase 13.3 Hold Control.
 
     Supports three `ducking_style` modes:
-    - `'dynamic'` (Phase 13 default): attenuates original audio to `duck_gain` during TTS and returns
-      to `unspoken_gain` (1.0) during non-TTS intervals with smooth cosine fades.
-    - `'continuous'` (Phase 13.1 stabilized mode): suppresses original audio across the ENTIRE video
-      at `duck_gain` (e.g. 0.15..0.20, default 0.18 = 18%) so original English never jumps back to 100%
-      when Japanese TTS ends.
+    - `'dynamic'` (Phase 13 default): attenuates original audio to `duck_gain` during TTS (and across held
+      inter-utterance gaps <= `hold_seconds` or `same_speaker_hold_seconds`) and returns to `unspoken_gain`
+      during longer non-TTS intervals with smooth cosine fades.
+    - `'continuous'` (Phase 13.1/13.3 stabilized mode): suppresses original audio across the ENTIRE video
+      at `duck_gain`, and when `hold_gap_gain` (or `hold_seconds`) is enabled, gently deepens attenuation
+      during unmasked inter-utterance hesitation gaps (such as 0:12-0:14) so English hesitations never jump out.
     - `'long-release'` (Phase 13.1 extended release mode): extends release time (`fade_in_seconds`) to
-      >= 1.5s (default 1.8s), bridges gaps up to >= 1.2s, and caps unspoken return level so volume
-      transitions remain gradual.
+      >= 1.5s (default 1.8s), bridges gaps, and caps unspoken return level so volume transitions remain gradual.
     """
     if total_frames is None and total_samples is not None:
         total_frames = total_samples
@@ -191,7 +296,7 @@ def build_ducking_envelope(
         ("fade_in_seconds", effective_fade_in, 0.0, 10.0),
         ("pre_duck_seconds", pre_duck_seconds, 0.0, 2.0),
         ("post_duck_seconds", post_duck_seconds, 0.0, 2.0),
-        ("min_unspoken_gap_seconds", effective_min_gap, 0.0, 10.0),
+        ("min_unspoken_gap_seconds", effective_min_gap, 0.0, 15.0),
     ]:
         if type(val) not in (int, float) or not math.isfinite(val) or not (lo <= val <= hi):
             raise ValueError(f"Invalid {label}: {val}")
@@ -199,68 +304,82 @@ def build_ducking_envelope(
         raise ValueError("curve must be 'cosine' or 'linear'.")
 
     total_duration = total_frames / float(sample_rate)
-    merged = merge_speech_intervals(
+    hold_res = apply_ducking_hold_control(
         speech_intervals,
         total_duration_seconds=total_duration,
         pre_duck_seconds=pre_duck_seconds,
         post_duck_seconds=post_duck_seconds,
         min_unspoken_gap_seconds=effective_min_gap,
+        hold_seconds=hold_seconds,
+        same_speaker_hold_seconds=same_speaker_hold_seconds,
     )
+    merged = hold_res["merged_windows"]
+    held_gaps = hold_res["held_gaps"]
 
     duck_g = float(duck_gain)
     unspoken_g = float(effective_unspoken_gain)
     env = np.full(total_frames, unspoken_g, dtype=np.float32)
-    if not merged or abs(unspoken_g - duck_g) < 1e-7:
-        return env, {
-            "ducking_style": ducking_style,
-            "duck_gain": duck_g,
-            "unspoken_gain": unspoken_g,
-            "fade_out_seconds": float(fade_out_seconds),
-            "fade_in_seconds": float(effective_fade_in),
-            "release_seconds": float(effective_fade_in),
-            "curve": curve,
-            "merged_speech_windows": merged,
-            "transition_count": 0,
-            "ducked_frame_fraction": 1.0 if abs(unspoken_g - duck_g) < 1e-7 else (0.0 if not merged else 1.0),
-            "unspoken_frame_fraction": 0.0 if abs(unspoken_g - duck_g) < 1e-7 else (1.0 if not merged else 0.0),
-            "min_gain": round(float(np.min(env)), 4),
-            "max_gain": round(float(np.max(env)), 4),
-            "prevents_100pct_return": bool(unspoken_g <= 0.35),
-        }
 
     fade_out_frames = max(1, int(round(float(fade_out_seconds) * sample_rate))) if fade_out_seconds > 0 else 0
     fade_in_frames = max(1, int(round(float(effective_fade_in) * sample_rate))) if effective_fade_in > 0 else 0
 
-    for a_sec, b_sec in merged:
-        s_idx = max(0, min(total_frames, int(round(a_sec * sample_rate))))
-        e_idx = max(s_idx, min(total_frames, int(round(b_sec * sample_rate))))
-        if e_idx > s_idx:
-            env[s_idx:e_idx] = np.minimum(env[s_idx:e_idx], duck_g)
+    if merged and abs(unspoken_g - duck_g) >= 1e-7:
+        for a_sec, b_sec in merged:
+            s_idx = max(0, min(total_frames, int(round(a_sec * sample_rate))))
+            e_idx = max(s_idx, min(total_frames, int(round(b_sec * sample_rate))))
+            if e_idx > s_idx:
+                env[s_idx:e_idx] = np.minimum(env[s_idx:e_idx], duck_g)
 
-        if fade_out_frames > 0 and s_idx > 0:
-            ramp_start = max(0, s_idx - fade_out_frames)
-            ramp_len = s_idx - ramp_start
-            if ramp_len > 0:
-                t = np.linspace(0.0, 1.0, ramp_len, endpoint=False, dtype=np.float32)
-                w = (0.5 * (1.0 - np.cos(np.pi * t))).astype(np.float32) if curve == "cosine" else t
-                ramp_vals = unspoken_g - (unspoken_g - duck_g) * w
-                env[ramp_start:s_idx] = np.minimum(env[ramp_start:s_idx], ramp_vals)
+            if fade_out_frames > 0 and s_idx > 0:
+                ramp_start = max(0, s_idx - fade_out_frames)
+                ramp_len = s_idx - ramp_start
+                if ramp_len > 0:
+                    t = np.linspace(0.0, 1.0, ramp_len, endpoint=False, dtype=np.float32)
+                    w = (0.5 * (1.0 - np.cos(np.pi * t))).astype(np.float32) if curve == "cosine" else t
+                    ramp_vals = unspoken_g - (unspoken_g - duck_g) * w
+                    env[ramp_start:s_idx] = np.minimum(env[ramp_start:s_idx], ramp_vals)
 
-        if fade_in_frames > 0 and e_idx < total_frames:
-            ramp_end = min(total_frames, e_idx + fade_in_frames)
-            ramp_len = ramp_end - e_idx
-            if ramp_len > 0:
-                t = np.linspace(0.0, 1.0, ramp_len, endpoint=False, dtype=np.float32)
-                w = (0.5 * (1.0 - np.cos(np.pi * t))).astype(np.float32) if curve == "cosine" else t
-                ramp_vals = duck_g + (unspoken_g - duck_g) * w
-                env[e_idx:ramp_end] = np.minimum(env[e_idx:ramp_end], ramp_vals)
+            if fade_in_frames > 0 and e_idx < total_frames:
+                ramp_end = min(total_frames, e_idx + fade_in_frames)
+                ramp_len = ramp_end - e_idx
+                if ramp_len > 0:
+                    t = np.linspace(0.0, 1.0, ramp_len, endpoint=False, dtype=np.float32)
+                    w = (0.5 * (1.0 - np.cos(np.pi * t))).astype(np.float32) if curve == "cosine" else t
+                    ramp_vals = duck_g + (unspoken_g - duck_g) * w
+                    env[e_idx:ramp_end] = np.minimum(env[e_idx:ramp_end], ramp_vals)
 
-    ducked_mask = np.abs(env - duck_g) <= 0.02 * max(1.0, abs(unspoken_g - duck_g))
+    # Phase 13.3: Optional deeper hold attenuation during unmasked inter-utterance gaps (e.g. 0:12-0:14 hesitation)
+    eff_hold_gap_gain = float(hold_gap_gain) if hold_gap_gain is not None else duck_g
+    if held_gaps and eff_hold_gap_gain < duck_g - 1e-5:
+        ramp_frames = max(1, int(round(0.12 * sample_rate)))
+        for hg in held_gaps:
+            gs_idx = max(0, min(total_frames, int(round(float(hg["gap_start_seconds"]) * sample_rate))))
+            ge_idx = max(gs_idx, min(total_frames, int(round(float(hg["gap_end_seconds"]) * sample_rate))))
+            if ge_idx - gs_idx <= 2 * ramp_frames:
+                env[gs_idx:ge_idx] = np.minimum(env[gs_idx:ge_idx], eff_hold_gap_gain)
+            else:
+                t_r = np.linspace(0.0, 1.0, ramp_frames, endpoint=False, dtype=np.float32)
+                w_r = (0.5 * (1.0 - np.cos(np.pi * t_r))).astype(np.float32)
+                down_ramp = duck_g - (duck_g - eff_hold_gap_gain) * w_r
+                up_ramp = eff_hold_gap_gain + (duck_g - eff_hold_gap_gain) * w_r
+                env[gs_idx : gs_idx + ramp_frames] = np.minimum(env[gs_idx : gs_idx + ramp_frames], down_ramp)
+                env[gs_idx + ramp_frames : ge_idx - ramp_frames] = np.minimum(
+                    env[gs_idx + ramp_frames : ge_idx - ramp_frames],
+                    eff_hold_gap_gain,
+                )
+                env[ge_idx - ramp_frames : ge_idx] = np.minimum(env[ge_idx - ramp_frames : ge_idx], up_ramp)
+
+    ducked_mask = env <= duck_g + 0.02 * max(1.0, abs(unspoken_g - duck_g))
     unspoken_mask = np.abs(env - unspoken_g) <= 0.02 * max(1.0, abs(unspoken_g - duck_g))
     return env, {
         "ducking_style": ducking_style,
         "duck_gain": duck_g,
         "unspoken_gain": unspoken_g,
+        "hold_seconds": float(hold_seconds) if hold_seconds is not None else None,
+        "same_speaker_hold_seconds": float(same_speaker_hold_seconds) if same_speaker_hold_seconds is not None else None,
+        "hold_gap_gain": round(eff_hold_gap_gain, 4),
+        "held_gap_count": len(held_gaps),
+        "held_gaps": held_gaps,
         "fade_out_seconds": float(fade_out_seconds),
         "fade_in_seconds": float(effective_fade_in),
         "release_seconds": float(effective_fade_in),
@@ -269,12 +388,376 @@ def build_ducking_envelope(
         "min_unspoken_gap_seconds": float(effective_min_gap),
         "curve": curve,
         "merged_speech_windows": merged,
-        "transition_count": len(merged) * 2,
-        "ducked_frame_fraction": round(float(np.mean(ducked_mask)), 4),
-        "unspoken_frame_fraction": round(float(np.mean(unspoken_mask)), 4),
+        "transition_count": 0 if (not merged or abs(unspoken_g - duck_g) < 1e-7) else len(merged) * 2,
+        "ducked_frame_fraction": round(float(np.mean(ducked_mask)), 4) if total_frames > 0 else 0.0,
+        "unspoken_frame_fraction": (
+            0.0
+            if abs(unspoken_g - duck_g) < 1e-7
+            else round(float(np.mean(unspoken_mask)), 4)
+        ),
         "min_gain": round(float(np.min(env)), 4),
         "max_gain": round(float(np.max(env)), 4),
         "prevents_100pct_return": bool(unspoken_g <= 0.35),
+    }
+
+
+def _apply_bs1770_k_weighting(mono_samples, sample_rate=RATE):
+    """Apply exact ITU-R BS.1770-4 two-stage K-weighting filter (Stage 1 high-shelf +4dB above 1.5kHz
+    + Stage 2 RLB high-pass at 38Hz) via fast FFT transfer function evaluation.
+    """
+    x = np.asarray(mono_samples, dtype=np.float64)
+    n = len(x)
+    if n < 8:
+        return x.copy()
+    freqs = np.fft.rfftfreq(n, d=1.0 / float(sample_rate))
+    # Stage 1: Acoustic head/ear high-shelf filter (+4.0 dB above ~1682 Hz, Q=0.707175)
+    f0_shelf = 1681.974450955533
+    g_linear = 10.0 ** (3.999843853973347 / 20.0)
+    s_norm = freqs / f0_shelf
+    shelf_mag_sq = (1.0 + (g_linear ** 2) * (s_norm ** 4) + 2.0 * g_linear * (s_norm ** 2)) / (
+        1.0 + (s_norm ** 4) + 2.0 * (s_norm ** 2)
+    )
+    # Stage 2: RLB high-pass weighting filter (f0 = 38.13547 Hz, Q = 0.500327)
+    f0_hp = 38.13547087602444
+    hp_norm_sq = (freqs / f0_hp) ** 2
+    hp_mag_sq = (hp_norm_sq ** 2) / (1.0 + (hp_norm_sq ** 2) + 2.0 * hp_norm_sq)
+    hp_mag_sq[0] = 0.0
+
+    k_mag = np.sqrt(shelf_mag_sq * hp_mag_sq)
+    spec = np.fft.rfft(x)
+    y_k = np.fft.irfft(spec * k_mag, n=n)
+    return y_k
+
+
+def measure_audio_lufs(samples, sample_rate=RATE):
+    """Measure ITU-R BS.1770-4 K-weighted loudness (Integrated LUFS, Momentary Max LUFS, Active Speech LUFS),
+    RMS dBFS, and True Peak dBFS for mono or stereo audio arrays.
+    """
+    arr = np.asarray(samples, dtype=np.float64)
+    if arr.size == 0:
+        return {
+            "integrated_lufs": -70.0,
+            "momentary_max_lufs": -70.0,
+            "active_speech_lufs": -70.0,
+            "rms_dbfs": -70.0,
+            "peak_dbfs": -70.0,
+            "peak_amplitude": 0.0,
+            "high_freq_presence_ratio": 0.0,
+            "duration_seconds": 0.0,
+        }
+    mono = np.mean(arr, axis=1) if arr.ndim == 2 else arr
+    n = len(mono)
+    dur_sec = n / float(max(1, sample_rate))
+    peak_amp = float(np.max(np.abs(arr)))
+    rms_amp = float(np.sqrt(np.mean(np.square(mono))))
+    peak_dbfs = round(20.0 * math.log10(max(peak_amp, 1e-9)), 2)
+    rms_dbfs = round(20.0 * math.log10(max(rms_amp, 1e-9)), 2)
+
+    y_k = _apply_bs1770_k_weighting(mono, sample_rate=sample_rate)
+    sq_k = np.square(y_k)
+
+    # High-frequency presence energy ratio (1.5 kHz .. 4.5 kHz vs total)
+    spec = np.abs(np.fft.rfft(mono)) ** 2
+    freqs = np.fft.rfftfreq(n, d=1.0 / float(sample_rate))
+    tot_e = float(np.sum(spec))
+    pres_e = float(np.sum(spec[(freqs >= 1400.0) & (freqs <= 4500.0)]))
+    presence_ratio = round(pres_e / max(tot_e, 1e-12), 4)
+
+    # Gated block loudness (400ms BS.1770 blocks for >=0.5s audio; 100ms blocks for short utterances)
+    block_sec = 0.400 if dur_sec >= 0.60 else max(0.050, dur_sec * 0.40)
+    step_sec = block_sec * 0.25
+    b_len = max(1, int(round(block_sec * sample_rate)))
+    s_len = max(1, int(round(step_sec * sample_rate)))
+
+    block_powers = []
+    for pos in range(0, max(1, n - b_len + 1), s_len):
+        blk = sq_k[pos : pos + b_len]
+        if blk.size > 0:
+            block_powers.append(float(np.mean(blk)))
+    if not block_powers:
+        block_powers = [float(np.mean(sq_k))]
+
+    bp_arr = np.asarray(block_powers, dtype=np.float64)
+    # Absolute gate at -70 LKFS
+    abs_gate_p = 10.0 ** ((-70.0 + 0.691) / 10.0)
+    above_abs = bp_arr[bp_arr > abs_gate_p]
+    if above_abs.size == 0:
+        integrated_lufs = -70.0
+    else:
+        rel_thresh_p = float(np.mean(above_abs)) * (10.0 ** (-10.0 / 10.0))
+        above_rel = above_abs[above_abs >= rel_thresh_p]
+        gated_mean_p = float(np.mean(above_rel)) if above_rel.size > 0 else float(np.mean(above_abs))
+        integrated_lufs = round(-0.691 + 10.0 * math.log10(max(gated_mean_p, 1e-12)), 2)
+
+    # Short-window (150ms) active speech & momentary max LUFS (critical for short utterances like "あらゆることに？")
+    short_len = max(1, int(round(min(0.200, max(0.040, dur_sec * 0.35)) * sample_rate)))
+    short_step = max(1, short_len // 4)
+    short_powers = [
+        float(np.mean(sq_k[p : p + short_len]))
+        for p in range(0, max(1, n - short_len + 1), short_step)
+    ] or [float(np.mean(sq_k))]
+    sp_arr = np.asarray(short_powers, dtype=np.float64)
+    max_p = float(np.max(sp_arr))
+    momentary_max_lufs = round(-0.691 + 10.0 * math.log10(max(max_p, 1e-12)), 2)
+
+    active_sp = sp_arr[sp_arr >= max_p * 0.15]
+    active_p = float(np.mean(active_sp)) if active_sp.size > 0 else max_p
+    active_speech_lufs = round(-0.691 + 10.0 * math.log10(max(active_p, 1e-12)), 2)
+
+    return {
+        "integrated_lufs": integrated_lufs,
+        "momentary_max_lufs": momentary_max_lufs,
+        "active_speech_lufs": active_speech_lufs,
+        "rms_dbfs": rms_dbfs,
+        "peak_dbfs": peak_dbfs,
+        "peak_amplitude": round(peak_amp, 6),
+        "high_freq_presence_ratio": presence_ratio,
+        "duration_seconds": round(dur_sec, 4),
+    }
+
+
+def normalize_tts_samples_lufs(
+    samples,
+    sample_rate=RATE,
+    *,
+    target_lufs=DEFAULT_TARGET_LUFS,
+    max_gain_db=12.0,
+    min_gain_db=-12.0,
+    ceiling=PEAK_TARGET,
+):
+    """Normalize a TTS utterance waveform to `target_lufs` (default -16.0 LUFS) using linear K-weighted
+    BS.1770-4 gain + soft true-peak limiting so multi-speaker (male/female) loudness matches without
+    distorting intra-sentence prosody or clipping.
+    """
+    arr = np.asarray(samples, dtype=np.float64)
+    before = measure_audio_lufs(arr, sample_rate=sample_rate)
+    if arr.size == 0 or before["integrated_lufs"] <= -65.0:
+        return arr.astype(np.float32), {
+            "applied_gain_db": 0.0,
+            "linear_gain": 1.0,
+            "target_lufs": float(target_lufs),
+            "before": before,
+            "after": before,
+            "limiter": {"pre_peak": 0.0, "post_peak": 0.0, "limited_samples": 0},
+        }
+
+    # For short utterances (<1.6s, e.g. "あらゆることに？" at 0:10), weight active/momentary K-weighted loudness
+    # and high-frequency presence so short female interrogatives never jump out ahead of sustained speech.
+    dur = before["duration_seconds"]
+    if dur < 1.6:
+        effective_lufs = 0.55 * before["integrated_lufs"] + 0.45 * before["active_speech_lufs"]
+    else:
+        effective_lufs = 0.80 * before["integrated_lufs"] + 0.20 * before["active_speech_lufs"]
+
+    raw_gain_db = float(target_lufs) - effective_lufs
+    gain_db = float(np.clip(raw_gain_db, float(min_gain_db), float(max_gain_db)))
+    linear_gain = float(10.0 ** (gain_db / 20.0))
+
+    scaled = arr * linear_gain
+    limited, lim_report = apply_soft_limiter(scaled, ceiling=float(ceiling), knee=0.72)
+    after = measure_audio_lufs(limited, sample_rate=sample_rate)
+
+    return limited.astype(np.float32), {
+        "target_lufs": round(float(target_lufs), 2),
+        "effective_source_lufs": round(effective_lufs, 2),
+        "applied_gain_db": round(gain_db, 3),
+        "linear_gain": round(linear_gain, 5),
+        "before": before,
+        "after": after,
+        "limiter": lim_report,
+        "clipping_free": bool(float(np.max(np.abs(limited))) < 1.0),
+    }
+
+
+def normalize_tts_wav_lufs(
+    input_wav_path,
+    output_wav_path=None,
+    *,
+    target_lufs=DEFAULT_TARGET_LUFS,
+    method="bs1770_linear",
+    ceiling=PEAK_TARGET,
+    ffmpeg_bin=None,
+):
+    """Normalize a TTS WAV file on disk to `target_lufs` (-16.0 or -18.0 LUFS), supporting both
+    built-in BS.1770-4 linear K-weighted normalization (`'bs1770_linear'`) and FFmpeg `loudnorm` (`'ffmpeg_loudnorm'`).
+    """
+    in_p = Path(input_wav_path).resolve()
+    out_p = Path(output_wav_path).resolve() if output_wav_path else in_p
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    with wave.open(str(in_p), "rb") as wf:
+        sr = int(wf.getframerate() or 24000)
+        n_ch = int(wf.getnchannels() or 1)
+        n_frames = int(wf.getnframes() or 0)
+        raw = wf.readframes(n_frames)
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if n_ch > 1:
+        samples = samples.reshape(-1, n_ch).mean(axis=1)
+
+    if method == "ffmpeg_loudnorm":
+        before = measure_audio_lufs(samples, sample_rate=sr)
+        tmp_out = out_p.with_suffix(".loudnorm.tmp.wav")
+        tp_db = round(20.0 * math.log10(max(float(ceiling), 0.1)), 2)
+        cmd = [
+            ffmpeg_bin or "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(in_p),
+            "-af",
+            f"loudnorm=I={float(target_lufs):.1f}:TP={tp_db:.1f}:LRA=11",
+            "-ar",
+            str(sr),
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            str(tmp_out),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode == 0 and tmp_out.is_file():
+            with wave.open(str(tmp_out), "rb") as wf2:
+                raw2 = wf2.readframes(wf2.getnframes())
+            norm_samples = np.frombuffer(raw2, dtype="<i2").astype(np.float32) / 32768.0
+            norm_samples, lim_rep = apply_soft_limiter(norm_samples, ceiling=float(ceiling), knee=0.72)
+            pcm = np.clip(np.round(norm_samples * 32767.0), -32768, 32767).astype("<i2")
+            with wave.open(str(out_p), "wb") as wf_out:
+                wf_out.setnchannels(1)
+                wf_out.setsampwidth(2)
+                wf_out.setframerate(sr)
+                wf_out.writeframes(pcm.tobytes())
+            tmp_out.unlink(missing_ok=True)
+            after = measure_audio_lufs(norm_samples, sample_rate=sr)
+            return out_p, {
+                "method": "ffmpeg_loudnorm",
+                "target_lufs": round(float(target_lufs), 2),
+                "applied_gain_db": round(after["integrated_lufs"] - before["integrated_lufs"], 3),
+                "before": before,
+                "after": after,
+                "limiter": lim_rep,
+                "clipping_free": True,
+            }
+
+    norm_samples, rep = normalize_tts_samples_lufs(
+        samples,
+        sample_rate=sr,
+        target_lufs=target_lufs,
+        ceiling=ceiling,
+    )
+    pcm = np.clip(np.round(norm_samples * 32767.0), -32768, 32767).astype("<i2")
+    with wave.open(str(out_p), "wb") as wf_out:
+        wf_out.setnchannels(1)
+        wf_out.setsampwidth(2)
+        wf_out.setframerate(sr)
+        wf_out.writeframes(pcm.tobytes())
+    rep["method"] = "bs1770_linear"
+    rep["output_wav"] = str(out_p)
+    return out_p, rep
+
+
+def build_lufs_normalization_report(utterance_records, *, target_lufs=DEFAULT_TARGET_LUFS):
+    """Build Phase 13.3 verification report for multi-speaker LUFS loudness normalization."""
+    records = list(utterance_records or [])
+    by_spk_before = {}
+    by_spk_after = {}
+    all_before = []
+    all_after = []
+
+    for r in records:
+        spk = str(r.get("speaker") or "SPEAKER_01")
+        b_lufs = float(r["before"]["integrated_lufs"])
+        a_lufs = float(r["after"]["integrated_lufs"])
+        by_spk_before.setdefault(spk, []).append(b_lufs)
+        by_spk_after.setdefault(spk, []).append(a_lufs)
+        all_before.append(b_lufs)
+        all_after.append(a_lufs)
+
+    spk_summary = {}
+    for spk in sorted(by_spk_before.keys()):
+        b_vals = by_spk_before[spk]
+        a_vals = by_spk_after[spk]
+        spk_summary[spk] = {
+            "utterance_count": len(b_vals),
+            "mean_lufs_before": round(float(np.mean(b_vals)), 2),
+            "mean_lufs_after": round(float(np.mean(a_vals)), 2),
+            "max_lufs_before": round(float(np.max(b_vals)), 2),
+            "max_lufs_after": round(float(np.max(a_vals)), 2),
+        }
+
+    spk_means_before = [v["mean_lufs_before"] for v in spk_summary.values()]
+    spk_means_after = [v["mean_lufs_after"] for v in spk_summary.values()]
+    inter_spk_spread_before = round(max(spk_means_before) - min(spk_means_before), 2) if len(spk_means_before) >= 2 else 0.0
+    inter_spk_spread_after = round(max(spk_means_after) - min(spk_means_after), 2) if len(spk_means_after) >= 2 else 0.0
+
+    utt_range_before = round(max(all_before) - min(all_before), 2) if len(all_before) >= 2 else 0.0
+    utt_range_after = round(max(all_after) - min(all_after), 2) if len(all_after) >= 2 else 0.0
+
+    return {
+        "kind": "transclip_phase13_3_lufs_normalization_report",
+        "format_version": 1,
+        "target_lufs": round(float(target_lufs), 2),
+        "utterance_count": len(records),
+        "speakers": spk_summary,
+        "inter_speaker_lufs_spread_before_lu": inter_spk_spread_before,
+        "inter_speaker_lufs_spread_after_lu": inter_spk_spread_after,
+        "utterance_lufs_range_before_lu": utt_range_before,
+        "utterance_lufs_range_after_lu": utt_range_after,
+        "utterances": records,
+        "all_clipping_free": all(bool(r.get("clipping_free", True)) for r in records),
+        "loudness_disparity_reduced": bool(inter_spk_spread_after <= inter_spk_spread_before + 1e-4 and utt_range_after <= utt_range_before + 1e-4),
+    }
+
+
+def build_ducking_verification_report(
+    ducking_envelope_report,
+    loudness_verification,
+    *,
+    source_samples=None,
+    background_samples=None,
+    sample_rate=RATE,
+    focus_window_seconds=(12.0, 14.5),
+):
+    """Build Phase 13.3 verification report for inter-utterance ducking hold control (including 0:12-0:14 check)."""
+    w_start, w_end = float(focus_window_seconds[0]), float(focus_window_seconds[1])
+    window_metrics = None
+    if source_samples is not None and background_samples is not None:
+        src_arr = np.asarray(source_samples, dtype=np.float64)
+        bg_arr = np.asarray(background_samples, dtype=np.float64)
+        src_mono = np.mean(src_arr, axis=1) if src_arr.ndim == 2 else src_arr
+        bg_mono = np.mean(bg_arr, axis=1) if bg_arr.ndim == 2 else bg_arr
+        s_i = max(0, min(len(src_mono), int(round(w_start * sample_rate))))
+        e_i = max(s_i, min(len(src_mono), int(round(w_end * sample_rate))))
+        if e_i > s_i:
+            src_rms = float(np.sqrt(np.mean(np.square(src_mono[s_i:e_i]))))
+            bg_rms = float(np.sqrt(np.mean(np.square(bg_mono[s_i:e_i]))))
+            ratio = round(bg_rms / max(src_rms, 1e-8), 4) if src_rms > 1e-6 else 0.0
+            att_db = round(20.0 * math.log10(max(ratio, 1e-6)), 2) if ratio > 0 else -60.0
+            window_metrics = {
+                "window_seconds": [round(w_start, 2), round(w_end, 2)],
+                "source_rms": round(src_rms, 6),
+                "ducked_background_rms": round(bg_rms, 6),
+                "effective_gain_ratio": ratio,
+                "attenuation_db": att_db,
+                "english_prominence_suppressed": bool(ratio <= 0.20),
+            }
+
+    return {
+        "kind": "transclip_phase13_3_ducking_verification_report",
+        "format_version": 1,
+        "ducking_style": (ducking_envelope_report or {}).get("ducking_style"),
+        "duck_gain": (ducking_envelope_report or {}).get("duck_gain"),
+        "hold_seconds": (ducking_envelope_report or {}).get("hold_seconds"),
+        "same_speaker_hold_seconds": (ducking_envelope_report or {}).get("same_speaker_hold_seconds"),
+        "hold_gap_gain": (ducking_envelope_report or {}).get("hold_gap_gain"),
+        "held_gap_count": (ducking_envelope_report or {}).get("held_gap_count", 0),
+        "held_gaps": (ducking_envelope_report or {}).get("held_gaps", []),
+        "merged_speech_windows": (ducking_envelope_report or {}).get("merged_speech_windows", []),
+        "prevents_100pct_return": bool((ducking_envelope_report or {}).get("prevents_100pct_return", True)),
+        "focus_window_0_12_to_0_14_verification": window_metrics,
+        "loudness_verification": loudness_verification,
     }
 
 

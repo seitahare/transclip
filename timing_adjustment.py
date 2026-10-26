@@ -165,16 +165,21 @@ def _estimate_unit_mora_weight(text):
     if not clean:
         return 1.0
     try:
-        from language.pronunciation import count_mora
-        m = count_mora(clean)
-        if isinstance(m, int) and m > 0:
-            base = float(m)
-        else:
-            base = float(len(re.sub(r'[\s、。！？!?,.…]', '', clean)))
+        from language.pronunciation import PronunciationDictionary, count_mora
+        norm_text, _ = PronunciationDictionary().normalize(clean)
+        kana_mora = count_mora(norm_text)
+        kanji_count = sum(1 for ch in norm_text if '\u4e00' <= ch <= '\u9fff')
+        ascii_alnum = sum(1 for ch in norm_text if ch.isascii() and ch.isalnum())
+        base = float(kana_mora + 2 * kanji_count + ascii_alnum)
+        if base <= 0:
+            base = float(max(1, len(re.sub(r'[\s、。！？!?,.…]', '', clean))))
     except Exception:
-        base = float(max(1, len(re.sub(r'[\s、。！？!?,.…]', '', clean))))
+        stripped = re.sub(r'[\s、。！？!?,.…]', '', clean)
+        kanji_count = sum(1 for ch in stripped if '\u4e00' <= ch <= '\u9fff')
+        other_count = len(stripped) - kanji_count
+        base = float(max(1, other_count + 2 * kanji_count))
     # Account for natural clause/sentence pauses
-    comma_pauses = sum(1 for ch in clean if ch in '、，,') * 1.5
+    comma_pauses = sum(1 for ch in clean if ch in '、，,') * 2.2
     period_pauses = sum(1 for ch in clean if ch in '。！？!?') * 2.5
     return max(1.0, base + comma_pauses + period_pauses)
 

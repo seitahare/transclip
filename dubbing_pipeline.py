@@ -314,19 +314,22 @@ def parse_preset_speaker_mappings(items):
 
 
 def _estimate_japanese_mora(text_ja):
-    """Estimate Japanese mora count using repository `count_mora` when available, or accurate kana/kanji fallback."""
+    """Estimate Japanese mora count using PronunciationDictionary + count_mora + Kanji reading weight."""
     clean = str(text_ja or "").strip()
     if not clean:
         return 0
-    for mod_name in ("language.pronunciation", "language"):
-        try:
-            mod = __import__(mod_name, fromlist=["count_mora"])
-            if hasattr(mod, "count_mora"):
-                val = mod.count_mora(clean)
-                if isinstance(val, int) and val > 0:
-                    return val
-        except Exception:
-            pass
+    try:
+        from language.pronunciation import PronunciationDictionary, count_mora
+
+        norm_text, _ = PronunciationDictionary().normalize(clean)
+        kana_mora = count_mora(norm_text)
+        kanji_count = sum(1 for ch in norm_text if "\u4e00" <= ch <= "\u9fff")
+        ascii_alnum = sum(1 for ch in norm_text if ch.isascii() and ch.isalnum())
+        total = int(kana_mora + 2 * kanji_count + ascii_alnum)
+        if total > 0:
+            return total
+    except Exception:
+        pass
 
     # Fallback mora counter
     stripped = re.sub(r"[\s、。！？!?「」『』（）()［］\[\]・…―\-:;,.]", "", clean)
@@ -2944,16 +2947,25 @@ def _fallback_mix_audio_and_video(
     ambient_gain=0.85,
     boundary_fade_out_seconds=0.0,
     video_fade_out_seconds=0.0,
+    normalize_tts_lufs=True,
+    target_lufs=-16.0,
+    duck_hold_seconds=3.2,
+    same_speaker_hold_seconds=4.0,
+    hold_gap_gain=None,
     ffmpeg_bin=None,
 ):
-    """48kHz sample-accurate multi-speaker audio mixer & MP4 muxer with Phase 13 / 13.1 voice-over ducking
-    (dynamic, continuous 15-20%, and long-release >=1.5s), ambient sound separation, boundary fade-out,
-    soft-knee peak limiting, and loudness/clipping verification.
+    """48kHz sample-accurate multi-speaker audio mixer & MP4 muxer with Phase 13 / 13.1 / 13.3 voice-over ducking,
+    inter-utterance ducking hold control, ITU-R BS.1770-4 per-utterance LUFS loudness normalization,
+    ambient sound separation, boundary fade-out, soft-knee peak limiting, and loudness/clipping verification.
     """
     from audio_mixer import (
         apply_boundary_audio_fade,
         apply_soft_limiter,
         build_ducking_envelope,
+        build_ducking_verification_report,
+        build_lufs_normalization_report,
+        measure_audio_lufs,
+        normalize_tts_samples_lufs,
         separate_ambient_and_speech,
         verify_audio_loudness_and_clipping,
     )
@@ -2964,6 +2976,7 @@ def _fallback_mix_audio_and_video(
     total_frames = int(round(float(clip_duration) * target_sr))
     speaker_tracks = {}
     speech_intervals = []
+    utterance_lufs_records = []
 
     for entry in feedback_doc.get("entries", []):
         if entry.get("generation_status") != "complete":
@@ -2988,10 +3001,46 @@ def _fallback_mix_audio_and_video(
         end_frame = start_frame + len(samples)
         if start_frame < 0 or end_frame > total_frames:
             raise ValueError(f"Full WAV for utterance {uid} exceeds the selected clip; truncation refused.")
+
+        if normalize_tts_lufs:
+            samples, lufs_rep = normalize_tts_samples_lufs(
+                samples,
+                sample_rate=target_sr,
+                target_lufs=float(target_lufs),
+            )
+        else:
+            m_lufs = measure_audio_lufs(samples, sample_rate=target_sr)
+            lufs_rep = {
+                "target_lufs": float(target_lufs),
+                "effective_source_lufs": m_lufs["integrated_lufs"],
+                "applied_gain_db": 0.0,
+                "linear_gain": 1.0,
+                "before": m_lufs,
+                "after": m_lufs,
+                "clipping_free": True,
+            }
+        utterance_lufs_records.append(
+            {
+                "utterance_id": entry.get("id"),
+                "speaker": spk,
+                "text_ja": entry.get("text_ja", ""),
+                "clip_relative_start_seconds": round(rel_start, 4),
+                "clip_relative_end_seconds": round(end_frame / float(target_sr), 4),
+                **lufs_rep,
+            }
+        )
+
         if end_frame > start_frame:
             track = speaker_tracks.setdefault(spk, np.zeros(total_frames, dtype=np.float64))
             track[start_frame:end_frame] += samples[: end_frame - start_frame].astype(np.float64)
-            speech_intervals.append((rel_start, end_frame / float(target_sr)))
+            speech_intervals.append(
+                {
+                    "id": uid,
+                    "speaker": spk,
+                    "start": rel_start,
+                    "end": end_frame / float(target_sr),
+                }
+            )
 
     japanese_master = np.zeros(total_frames, dtype=np.float64)
     tracks_dir = out_dir / "tracks"
@@ -3042,6 +3091,11 @@ def _fallback_mix_audio_and_video(
     background_track = np.zeros(total_frames, dtype=np.float64)
     ambient_wav_path = None
 
+    eff_hold_gap = (
+        float(hold_gap_gain)
+        if hold_gap_gain is not None
+        else (min(float(duck_gain), 0.11) if duck_hold_seconds is not None else None)
+    )
     if source_audio is not None and normalized_mode != "japanese-only":
         env, ducking_envelope_report = build_ducking_envelope(
             total_frames,
@@ -3052,6 +3106,9 @@ def _fallback_mix_audio_and_video(
             fade_out_seconds=float(fade_out_seconds),
             fade_in_seconds=float(fade_in_seconds),
             release_seconds=release_seconds,
+            hold_seconds=duck_hold_seconds,
+            same_speaker_hold_seconds=same_speaker_hold_seconds,
+            hold_gap_gain=eff_hold_gap,
             ducking_style=eff_ducking_style,
         )
         if normalized_mode == "reference-mix":
@@ -3205,6 +3262,17 @@ def _fallback_mix_audio_and_video(
             }
         )
 
+    lufs_normalization_report = build_lufs_normalization_report(
+        utterance_lufs_records,
+        target_lufs=float(target_lufs),
+    )
+    ducking_verification_report = build_ducking_verification_report(
+        ducking_envelope_report,
+        loudness_verification,
+        source_samples=source_audio,
+        background_samples=background_track,
+        sample_rate=target_sr,
+    )
     eff_unspoken_out = float(ducking_envelope_report.get("unspoken_gain", unspoken_gain)) if ducking_envelope_report else float(unspoken_gain)
     mix_report = {
         "kind": "transclip_mix_report",
@@ -3214,6 +3282,10 @@ def _fallback_mix_audio_and_video(
         "duck_gain": float(duck_gain) if normalized_mode != "japanese-only" else 0.0,
         "unspoken_gain": eff_unspoken_out if normalized_mode != "japanese-only" else 0.0,
         "tts_gain": float(tts_gain),
+        "normalize_tts_lufs": bool(normalize_tts_lufs),
+        "target_lufs": float(target_lufs),
+        "duck_hold_seconds": float(duck_hold_seconds) if duck_hold_seconds is not None else None,
+        "same_speaker_hold_seconds": float(same_speaker_hold_seconds) if same_speaker_hold_seconds is not None else None,
         "boundary_fade_out_seconds": float(boundary_fade_out_seconds or 0.0),
         "video_fade_out_seconds": float(video_fade_out_seconds or 0.0),
         "sample_rate": target_sr,
@@ -3222,6 +3294,8 @@ def _fallback_mix_audio_and_video(
         "peak_amplitude": round(float(np.max(np.abs(master))) if len(master) else 0.0, 5),
         "limiter": limiter_report,
         "ducking_envelope": ducking_envelope_report,
+        "ducking_verification": ducking_verification_report,
+        "lufs_normalization": lufs_normalization_report,
         "ambient_separation": ambient_separation_report,
         "loudness_verification": loudness_verification,
         "dubbed_audio_wav": str(dubbed_wav),
@@ -3258,6 +3332,11 @@ def _invoke_audio_mixer(
     ambient_gain=0.85,
     boundary_fade_out_seconds=0.0,
     video_fade_out_seconds=0.0,
+    normalize_tts_lufs=True,
+    target_lufs=-16.0,
+    duck_hold_seconds=3.2,
+    same_speaker_hold_seconds=4.0,
+    hold_gap_gain=None,
     max_timing_shift=0.5,
     prefer_internal_mixer=False,
 ):
@@ -3328,6 +3407,11 @@ def _invoke_audio_mixer(
         ambient_gain=ambient_gain,
         boundary_fade_out_seconds=boundary_fade_out_seconds,
         video_fade_out_seconds=video_fade_out_seconds,
+        normalize_tts_lufs=normalize_tts_lufs,
+        target_lufs=target_lufs,
+        duck_hold_seconds=duck_hold_seconds,
+        same_speaker_hold_seconds=same_speaker_hold_seconds,
+        hold_gap_gain=hold_gap_gain,
     )
 
 
@@ -3378,6 +3462,7 @@ def _fallback_generate_subtitles_and_mp4(
         SubtitleStyleConfig,
         _ass_alpha_hex,
         align_entry_cues,
+        build_subtitle_sync_report,
         check_subtitle_overflow,
         format_subtitle_display_lines,
         prevent_line_overflow,
@@ -3421,6 +3506,7 @@ def _fallback_generate_subtitles_and_mp4(
                     }
                 )
 
+    subtitle_sync_report = build_subtitle_sync_report(entries, style=style)
     aligned_entries = []
     alignment_warnings = {}
     for entry in entries:
@@ -3586,6 +3672,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         "cue_count": len(cues_meta),
         "cues": cues_meta,
         "overflow_check": overflow_check,
+        "subtitle_sync_report": subtitle_sync_report,
         "held_verification_target_count": len(speaker_verification_targets or []),
         "srt_path": str(srt_path),
         "ass_path": str(ass_path),
@@ -3855,6 +3942,11 @@ def run_phase11_dubbing_pipeline(
     auto_rebalance_overlong=False,
     utterance_translations_path=None,
     source_video_duration=None,
+    normalize_tts_lufs=True,
+    target_lufs=-16.0,
+    duck_hold_seconds=3.2,
+    same_speaker_hold_seconds=4.0,
+    hold_gap_gain=None,
 ):
     """Execute the end-to-end Japanese dubbing pipeline (supporting Phase 11, Phase 12, Phase 13, Phase 13.1, and Phase 13.2 workflows)."""
     root = Path(output_dir).resolve()
@@ -4543,6 +4635,11 @@ def run_phase11_dubbing_pipeline(
         ambient_gain=ambient_gain,
         boundary_fade_out_seconds=boundary_fade_out_seconds,
         video_fade_out_seconds=video_fade_out_seconds,
+        normalize_tts_lufs=normalize_tts_lufs,
+        target_lufs=target_lufs,
+        duck_hold_seconds=duck_hold_seconds,
+        same_speaker_hold_seconds=same_speaker_hold_seconds,
+        hold_gap_gain=hold_gap_gain,
         max_timing_shift=max_timing_shift,
         prefer_internal_mixer=prefer_internal,
     )
@@ -4655,9 +4752,15 @@ def run_phase11_dubbing_pipeline(
     voice_consistency_json = (root if emit_phase13_2_reports else work_dir) / "voice_consistency_report.json"
     speaker_assignment_json = (root if emit_phase13_2_reports else work_dir) / "speaker_assignment_report.json"
     timing_quality_json = (root if emit_phase13_2_reports else work_dir) / "timing_quality_report.json"
+    subtitle_sync_json = (root if emit_phase13_2_reports else work_dir) / "subtitle_sync_report.json"
+    ducking_verification_json = (root if emit_phase13_2_reports else work_dir) / "ducking_verification_report.json"
+    lufs_normalization_json = (root if emit_phase13_2_reports else work_dir) / "lufs_normalization_report.json"
     _atomic_write_json(voice_consistency_json, voice_consistency_report)
     _atomic_write_json(speaker_assignment_json, speaker_assignment_report)
     _atomic_write_json(timing_quality_json, timing_quality_report)
+    _atomic_write_json(subtitle_sync_json, sub_report.get("subtitle_sync_report") or {})
+    _atomic_write_json(ducking_verification_json, mix_report.get("ducking_verification") or {})
+    _atomic_write_json(lufs_normalization_json, mix_report.get("lufs_normalization") or {})
 
     speaker_sample_wavs = {}
     if emit_phase13_2_reports:
@@ -4733,6 +4836,9 @@ def run_phase11_dubbing_pipeline(
         "voice_consistency_report": voice_consistency_report,
         "speaker_assignment_report": speaker_assignment_report,
         "timing_quality_report": timing_quality_report,
+        "subtitle_sync_report": sub_report.get("subtitle_sync_report"),
+        "ducking_verification_report": mix_report.get("ducking_verification"),
+        "lufs_normalization_report": mix_report.get("lufs_normalization"),
         "prosody_tuning": prosody_tuning_info,
         "voice_and_naturalness_evaluation": voice_evaluation,
         "rights_and_governance": voice_plan.get("rights_and_governance", []),
@@ -4775,6 +4881,9 @@ def run_phase11_dubbing_pipeline(
             "voice_consistency_report_json": str(voice_consistency_json),
             "speaker_assignment_report_json": str(speaker_assignment_json),
             "timing_quality_report_json": str(timing_quality_json),
+            "subtitle_sync_report_json": str(subtitle_sync_json),
+            "ducking_verification_report_json": str(ducking_verification_json),
+            "lufs_normalization_report_json": str(lufs_normalization_json),
             "speaker_voice_sample_wavs": speaker_sample_wavs,
             "speaker_verification_targets_json": str(verification_targets_path) if speaker_verification_targets else None,
         },
@@ -4861,6 +4970,11 @@ def run_phase13_dubbing_pipeline(
         "subtitle_background_box": True,
         "subtitle_strip_periods": True,
         "subtitle_comma_mode": "halfwidth_space",
+        "normalize_tts_lufs": True,
+        "target_lufs": -16.0,
+        "duck_hold_seconds": 3.2,
+        "same_speaker_hold_seconds": 4.0,
+        "hold_gap_gain": 0.11,
         "allow_diagnostic_on_collision": True,
     }
     defaults.update(kwargs)
@@ -4869,6 +4983,27 @@ def run_phase13_dubbing_pipeline(
         video_path=video_path,
         output_dir=output_dir,
         **defaults,
+    )
+
+
+def run_phase13_3_dubbing_pipeline(
+    *,
+    video_path,
+    script_path,
+    output_dir,
+    **kwargs,
+):
+    """Execute Phase 13.3 Japanese Dubbing Pipeline with:
+    1. Subtitle split timing synchronized to actual Japanese TTS clause pauses & Kanji-aware phonetic mora
+    2. Inter-utterance ducking hold control (same-speaker & <=3-4s gap hold)
+    3. Multi-speaker ITU-R BS.1770-4 LUFS loudness normalization (default -16.0 LUFS)
+    while preserving all Phase 13.2 speaker consistency, natural rate, and 2-line BudouX formatting.
+    """
+    return run_phase13_2_dubbing_pipeline(
+        video_path=video_path,
+        script_path=script_path,
+        output_dir=output_dir,
+        **kwargs,
     )
 
 
@@ -5380,6 +5515,10 @@ def _add_common_cli_arguments(p, *, is_phase12=False, is_phase13=False, is_phase
     p.add_argument("--duck-gain", type=float, default=0.18 if is_phase13_1 else 0.12, help="Original audio volume ratio during Japanese TTS speech (default: 0.18 in Phase 13.1, 0.12 in Phase 13)")
     p.add_argument("--unspoken-gain", type=float, default=0.18 if is_phase13_1 else 1.0, help="Original audio volume ratio during non-TTS intervals (default: 0.18 in continuous mode, 1.0 in dynamic)")
     p.add_argument("--tts-gain", type=float, default=1.0, help="Japanese TTS foreground volume multiplier (default: 1.0)")
+    p.add_argument("--target-lufs", type=float, default=-16.0, help="Target LUFS for per-utterance TTS loudness normalization (default: -16.0)")
+    p.add_argument("--no-lufs-normalize", dest="normalize_tts_lufs", action="store_false", default=True, help="Disable pre-mix LUFS normalization")
+    p.add_argument("--duck-hold-seconds", type=float, default=3.2, help="Hold ducking across inter-utterance gaps up to this duration in seconds (default: 3.2)")
+    p.add_argument("--same-speaker-hold-seconds", type=float, default=4.0, help="Hold ducking across consecutive same-speaker gaps up to this duration in seconds (default: 4.0)")
     p.add_argument("--duck-fade-out", type=float, default=0.18, help="Smooth ducking attack/fade-out seconds before TTS starts (default: 0.18)")
     p.add_argument("--duck-fade-in", type=float, default=0.25, help="Smooth ducking release/fade-in seconds after TTS ends (default: 0.25)")
     p.add_argument("--release-seconds", type=float, default=None, help="Explicit ducking release time in seconds (e.g. >= 1.5s for long-release)")
@@ -5515,6 +5654,7 @@ def _synthesize_mora_conditioned_speech_wav(
     harmonic_ratios=None,
     spectral_centroid_hz=680.0,
     sample_rate=24000,
+    peak_amplitude=0.58,
     seed=0,
 ):
     """Synthesize a speech-cadenced harmonic WAV shaped by Japanese mora structure and speaker F0/formants.
@@ -5556,12 +5696,19 @@ def _synthesize_mora_conditioned_speech_wav(
 
     # Syllable / mora amplitude envelope with comma micro-pauses
     syllable_env = 0.58 + 0.42 * _np.maximum(0.0, _np.sin(_np.pi * mora_rate_hz * t))
-    # Add short phrase pause dips if text has commas
-    comma_count = str(text_ja or "").count("、") + str(text_ja or "").count(",")
-    if comma_count > 0 and target_duration_seconds > 1.4:
-        for c_idx in range(1, comma_count + 1):
-            pause_center = target_duration_seconds * (c_idx / float(comma_count + 1))
-            dip = 1.0 - 0.82 * _np.exp(-0.5 * ((t - pause_center) / 0.065) ** 2)
+    # Place realistic clause pause valleys at the exact phonetic mora positions of commas (`、` / `,`)
+    raw_txt = str(text_ja or "")
+    clauses = [c for c in re.split(r"[、，,]", raw_txt) if c.strip()]
+    if len(clauses) >= 2 and target_duration_seconds > 1.4:
+        c_weights = [max(1, _estimate_japanese_mora(c)) for c in clauses]
+        tot_cw = float(sum(c_weights)) or 1.0
+        cum_cw = 0.0
+        speech_start_t = 0.04
+        speech_span_t = max(0.2, target_duration_seconds - 0.08)
+        for cw in c_weights[:-1]:
+            cum_cw += cw
+            pause_center = speech_start_t + speech_span_t * (cum_cw / tot_cw)
+            dip = 1.0 - 0.90 * _np.exp(-0.5 * ((t - pause_center) / 0.075) ** 2)
             syllable_env *= dip
 
     # Gentle consonant aspiration noise burst at mora onsets
@@ -5584,7 +5731,7 @@ def _synthesize_mora_conditioned_speech_wav(
     waveform *= env
     peak = float(_np.max(_np.abs(waveform))) if waveform.size else 0.0
     if peak > 1e-6:
-        waveform = waveform * (0.58 / peak)
+        waveform = waveform * (float(peak_amplitude) / peak)
 
     out_path = Path(output_wav_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6178,6 +6325,7 @@ def run_phase13_1_new_video_e2e(
                 preset_cent = 1060.0
                 spk_seed = 202
 
+            raw_peak_amp = 0.74 if spk == "SPEAKER_00" else 0.46
             _synthesize_mora_conditioned_speech_wav(
                 clone_wav_dir / f"dub-{idx:03d}.wav",
                 u["translated_text"],
@@ -6185,6 +6333,7 @@ def run_phase13_1_new_video_e2e(
                 f0_hz=clone_f0,
                 harmonic_ratios=clone_harm,
                 spectral_centroid_hz=clone_cent,
+                peak_amplitude=raw_peak_amp,
                 seed=spk_seed,
             )
             _synthesize_mora_conditioned_speech_wav(
@@ -6194,6 +6343,7 @@ def run_phase13_1_new_video_e2e(
                 f0_hz=preset_f0,
                 harmonic_ratios=preset_harm,
                 spectral_centroid_hz=preset_cent,
+                peak_amplitude=raw_peak_amp,
                 seed=spk_seed + 500,
             )
 
@@ -6289,6 +6439,9 @@ def run_phase13_1_new_video_e2e(
         "voice_consistency_report.json",
         "speaker_assignment_report.json",
         "timing_quality_report.json",
+        "subtitle_sync_report.json",
+        "ducking_verification_report.json",
+        "lufs_normalization_report.json",
         "speaker_voice_registry.json",
         "speaker_00_voice_samples.wav",
         "speaker_01_voice_samples.wav",
@@ -6458,6 +6611,9 @@ def run_phase13_1_new_video_e2e(
             "voice_consistency_report_json": str(out_dir / "voice_consistency_report.json"),
             "speaker_assignment_report_json": str(out_dir / "speaker_assignment_report.json"),
             "timing_quality_report_json": str(out_dir / "timing_quality_report.json"),
+            "subtitle_sync_report_json": str(out_dir / "subtitle_sync_report.json"),
+            "ducking_verification_report_json": str(out_dir / "ducking_verification_report.json"),
+            "lufs_normalization_report_json": str(out_dir / "lufs_normalization_report.json"),
             "speaker_voice_registry_json": str(out_dir / "speaker_voice_registry.json"),
             "pipeline_report_json": str(out_dir / "pipeline_report.json"),
         },
@@ -6468,6 +6624,38 @@ def run_phase13_1_new_video_e2e(
     _write_json(stages_dir / "13_quality_report.json", clone_report["new_video_e2e_verification"])
     (out_dir / "pipeline_report.md").write_text(_format_pipeline_report_md(clone_report), encoding="utf-8")
     return top_report_path, clone_report
+
+
+def run_phase13_3_e2e(
+    *,
+    input_dir="input/XuoqKYxDHVc",
+    source_video_path=None,
+    output_dir="output/phase13_3_verification",
+    clip_start=1836.45,
+    clip_end=1871.0,
+    auto_extend_clip=True,
+    max_clip_extension_seconds=12.0,
+    duck_gain=0.18,
+    ducking_style="continuous",
+    mix_mode="continuous-voiceover",
+    sync_anchor="content_start",
+    reference_fallback_dir="/tmp/phase12_result",
+):
+    """Execute Phase 13.3 end-to-end verification and generate comparison MP4s and Phase 13.3 verification reports."""
+    return run_phase13_1_new_video_e2e(
+        input_dir=input_dir,
+        source_video_path=source_video_path,
+        output_dir=output_dir,
+        clip_start=clip_start,
+        clip_end=clip_end,
+        auto_extend_clip=auto_extend_clip,
+        max_clip_extension_seconds=max_clip_extension_seconds,
+        duck_gain=duck_gain,
+        ducking_style=ducking_style,
+        mix_mode=mix_mode,
+        sync_anchor=sync_anchor,
+        reference_fallback_dir=reference_fallback_dir,
+    )
 
 
 def run_phase13_2_e2e(
@@ -6513,6 +6701,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
 
     for e2e_cmd, default_out in [
+        ("run-phase13-3-e2e", "output/phase13_3_verification"),
         ("run-phase13-2-e2e", "output/phase13_2_verification"),
         ("run-phase13-1-e2e", "output/phase13_1_new_video_e2e"),
     ]:
@@ -6530,8 +6719,14 @@ def main(argv=None):
         p_e2e.add_argument("--duck-gain", type=float, default=0.18, help="Continuous ducking ratio (default: 0.18 = 18%%)")
         p_e2e.add_argument("--ducking-style", choices=("continuous", "long-release", "dynamic"), default="continuous")
         p_e2e.add_argument("--mix-mode", default="continuous-voiceover")
-        p_e2e.add_argument("--sync-anchor", choices=("adaptive", "content_start", "end", "start"), default="content_start" if e2e_cmd == "run-phase13-2-e2e" else "adaptive")
+        p_e2e.add_argument("--sync-anchor", choices=("adaptive", "content_start", "end", "start"), default="content_start" if e2e_cmd in ("run-phase13-2-e2e", "run-phase13-3-e2e") else "adaptive")
         p_e2e.add_argument("--output", "--output-dir", dest="output", default=default_out)
+
+    p_p13_3 = sub.add_parser(
+        "run-phase13-3",
+        help="Run Phase 13.3 universal Japanese dubbing pipeline with TTS-synced subtitle splits, ducking hold control, and multi-speaker LUFS normalization",
+    )
+    _add_common_cli_arguments(p_p13_3, is_phase12=False, is_phase13=True, is_phase13_1=True, is_phase13_2=True)
 
     p_p13_2 = sub.add_parser(
         "run-phase13-2",
@@ -6565,7 +6760,7 @@ def main(argv=None):
         _add_common_cli_arguments(p, is_phase12=False, is_phase13=False, is_phase13_1=False)
 
     args = parser.parse_args(raw_argv)
-    if args.command in ("run-phase13-1-e2e", "run-phase13-2-e2e"):
+    if args.command in ("run-phase13-1-e2e", "run-phase13-2-e2e", "run-phase13-3-e2e"):
         report_path, report = run_phase13_1_new_video_e2e(
             input_dir=args.input_dir,
             source_video_path=args.source_video,
@@ -6590,7 +6785,7 @@ def main(argv=None):
     speaker_atmosphere_map = parse_key_value_mappings(args.speaker_atmosphere, flag_name="--speaker-atmosphere")
     default_preset = args.default_preset_voice or ("Ryan" if (args.voice_mode == "preset" and not args.auto_select_preset and not speaker_age_map and not speaker_atmosphere_map) else None)
 
-    is_p13_2_cmd = args.command == "run-phase13-2"
+    is_p13_2_cmd = args.command in ("run-phase13-2", "run-phase13-3")
     report_path, report = run_phase11_dubbing_pipeline(
         script_path=args.script,
         video_path=args.video,
@@ -6654,6 +6849,10 @@ def main(argv=None):
         duck_gain=args.duck_gain,
         unspoken_gain=args.unspoken_gain,
         tts_gain=args.tts_gain,
+        normalize_tts_lufs=args.normalize_tts_lufs,
+        target_lufs=args.target_lufs,
+        duck_hold_seconds=args.duck_hold_seconds,
+        same_speaker_hold_seconds=args.same_speaker_hold_seconds,
         duck_fade_out_seconds=args.duck_fade_out,
         duck_fade_in_seconds=args.duck_fade_in,
         release_seconds=args.release_seconds,
