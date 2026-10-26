@@ -45,9 +45,12 @@ VALID_MIX_MODES = (
     "reference-mix",
     "voiceover",
     "ducking",
+    "continuous-voiceover",
+    "long-release-voiceover",
     "ambient",
     "hybrid-ambient",
 )
+VALID_DUCKING_STYLES = ("dynamic", "continuous", "long-release")
 
 
 def read_json(path):
@@ -129,37 +132,66 @@ def merge_speech_intervals(intervals, *, total_duration_seconds=None, pre_duck_s
 
 
 def build_ducking_envelope(
-    total_frames,
+    total_frames=None,
     *,
+    total_samples=None,
     sample_rate=RATE,
     speech_intervals=(),
     duck_gain=0.12,
     unspoken_gain=1.0,
     fade_out_seconds=0.18,
     fade_in_seconds=0.25,
+    release_seconds=None,
     pre_duck_seconds=0.06,
     post_duck_seconds=0.08,
     min_unspoken_gap_seconds=0.35,
     curve="cosine",
+    ducking_style="dynamic",
 ):
     """Build a sample-accurate 1D gain envelope for voice-over ducking.
 
-    - During active Japanese TTS speech: attenuates original audio to `duck_gain` (e.g. 0.10..0.15).
-    - During non-TTS intervals: retains original audio at `unspoken_gain` (default 1.0).
-    - Applies smooth raised-cosine (or linear) fade-out before speech starts and fade-in after speech ends.
+    Supports three `ducking_style` modes:
+    - `'dynamic'` (Phase 13 default): attenuates original audio to `duck_gain` during TTS and returns
+      to `unspoken_gain` (1.0) during non-TTS intervals with smooth cosine fades.
+    - `'continuous'` (Phase 13.1 stabilized mode): suppresses original audio across the ENTIRE video
+      at `duck_gain` (e.g. 0.15..0.20, default 0.18 = 18%) so original English never jumps back to 100%
+      when Japanese TTS ends.
+    - `'long-release'` (Phase 13.1 extended release mode): extends release time (`fade_in_seconds`) to
+      >= 1.5s (default 1.8s), bridges gaps up to >= 1.2s, and caps unspoken return level so volume
+      transitions remain gradual.
     """
+    if total_frames is None and total_samples is not None:
+        total_frames = total_samples
     if type(total_frames) is not int or total_frames <= 0:
         raise ValueError("total_frames must be a positive integer.")
     if type(sample_rate) is not int or sample_rate <= 0:
         raise ValueError("sample_rate must be a positive integer.")
+    if ducking_style not in VALID_DUCKING_STYLES:
+        raise ValueError(f"Unsupported ducking_style {ducking_style!r}; expected {VALID_DUCKING_STYLES}")
+
+    effective_fade_in = float(release_seconds) if release_seconds is not None else float(fade_in_seconds)
+    effective_unspoken_gain = float(unspoken_gain)
+    effective_min_gap = float(min_unspoken_gap_seconds)
+
+    if ducking_style == "continuous":
+        if abs(effective_unspoken_gain - 1.0) < 1e-6:
+            effective_unspoken_gain = float(duck_gain)
+        else:
+            effective_unspoken_gain = min(float(effective_unspoken_gain), max(float(duck_gain), 0.22))
+    elif ducking_style == "long-release":
+        effective_fade_in = max(1.5, effective_fade_in)
+        effective_min_gap = max(1.2, effective_min_gap)
+        if abs(effective_unspoken_gain - 1.0) < 1e-6:
+            effective_unspoken_gain = min(0.32, max(float(duck_gain) * 2.0, 0.24))
+
     for label, val, lo, hi in [
         ("duck_gain", duck_gain, 0.0, 0.5),
-        ("unspoken_gain", unspoken_gain, 0.0, 1.5),
-        ("fade_out_seconds", fade_out_seconds, 0.0, 3.0),
-        ("fade_in_seconds", fade_in_seconds, 0.0, 3.0),
-        ("pre_duck_seconds", pre_duck_seconds, 0.0, 1.0),
-        ("post_duck_seconds", post_duck_seconds, 0.0, 1.0),
-        ("min_unspoken_gap_seconds", min_unspoken_gap_seconds, 0.0, 5.0),
+        ("unspoken_gain", effective_unspoken_gain, 0.0, 1.5),
+        ("fade_out_seconds", fade_out_seconds, 0.0, 5.0),
+        ("fade_in_seconds", effective_fade_in, 0.0, 10.0),
+        ("pre_duck_seconds", pre_duck_seconds, 0.0, 2.0),
+        ("post_duck_seconds", post_duck_seconds, 0.0, 2.0),
+        ("min_unspoken_gap_seconds", effective_min_gap, 0.0, 10.0),
     ]:
         if type(val) not in (int, float) or not math.isfinite(val) or not (lo <= val <= hi):
             raise ValueError(f"Invalid {label}: {val}")
@@ -172,29 +204,32 @@ def build_ducking_envelope(
         total_duration_seconds=total_duration,
         pre_duck_seconds=pre_duck_seconds,
         post_duck_seconds=post_duck_seconds,
-        min_unspoken_gap_seconds=min_unspoken_gap_seconds,
+        min_unspoken_gap_seconds=effective_min_gap,
     )
 
     duck_g = float(duck_gain)
-    unspoken_g = float(unspoken_gain)
+    unspoken_g = float(effective_unspoken_gain)
     env = np.full(total_frames, unspoken_g, dtype=np.float32)
     if not merged or abs(unspoken_g - duck_g) < 1e-7:
         return env, {
+            "ducking_style": ducking_style,
             "duck_gain": duck_g,
             "unspoken_gain": unspoken_g,
             "fade_out_seconds": float(fade_out_seconds),
-            "fade_in_seconds": float(fade_in_seconds),
+            "fade_in_seconds": float(effective_fade_in),
+            "release_seconds": float(effective_fade_in),
             "curve": curve,
             "merged_speech_windows": merged,
             "transition_count": 0,
-            "ducked_frame_fraction": 0.0 if not merged else 1.0,
-            "unspoken_frame_fraction": 1.0 if not merged else 0.0,
-            "min_gain": float(np.min(env)),
-            "max_gain": float(np.max(env)),
+            "ducked_frame_fraction": 1.0 if abs(unspoken_g - duck_g) < 1e-7 else (0.0 if not merged else 1.0),
+            "unspoken_frame_fraction": 0.0 if abs(unspoken_g - duck_g) < 1e-7 else (1.0 if not merged else 0.0),
+            "min_gain": round(float(np.min(env)), 4),
+            "max_gain": round(float(np.max(env)), 4),
+            "prevents_100pct_return": bool(unspoken_g <= 0.35),
         }
 
     fade_out_frames = max(1, int(round(float(fade_out_seconds) * sample_rate))) if fade_out_seconds > 0 else 0
-    fade_in_frames = max(1, int(round(float(fade_in_seconds) * sample_rate))) if fade_in_seconds > 0 else 0
+    fade_in_frames = max(1, int(round(float(effective_fade_in) * sample_rate))) if effective_fade_in > 0 else 0
 
     for a_sec, b_sec in merged:
         s_idx = max(0, min(total_frames, int(round(a_sec * sample_rate))))
@@ -202,7 +237,6 @@ def build_ducking_envelope(
         if e_idx > s_idx:
             env[s_idx:e_idx] = np.minimum(env[s_idx:e_idx], duck_g)
 
-        # Smooth fade-out (attack) leading into s_idx
         if fade_out_frames > 0 and s_idx > 0:
             ramp_start = max(0, s_idx - fade_out_frames)
             ramp_len = s_idx - ramp_start
@@ -212,7 +246,6 @@ def build_ducking_envelope(
                 ramp_vals = unspoken_g - (unspoken_g - duck_g) * w
                 env[ramp_start:s_idx] = np.minimum(env[ramp_start:s_idx], ramp_vals)
 
-        # Smooth fade-in (release) trailing after e_idx
         if fade_in_frames > 0 and e_idx < total_frames:
             ramp_end = min(total_frames, e_idx + fade_in_frames)
             ramp_len = ramp_end - e_idx
@@ -225,13 +258,15 @@ def build_ducking_envelope(
     ducked_mask = np.abs(env - duck_g) <= 0.02 * max(1.0, abs(unspoken_g - duck_g))
     unspoken_mask = np.abs(env - unspoken_g) <= 0.02 * max(1.0, abs(unspoken_g - duck_g))
     return env, {
+        "ducking_style": ducking_style,
         "duck_gain": duck_g,
         "unspoken_gain": unspoken_g,
         "fade_out_seconds": float(fade_out_seconds),
-        "fade_in_seconds": float(fade_in_seconds),
+        "fade_in_seconds": float(effective_fade_in),
+        "release_seconds": float(effective_fade_in),
         "pre_duck_seconds": float(pre_duck_seconds),
         "post_duck_seconds": float(post_duck_seconds),
-        "min_unspoken_gap_seconds": float(min_unspoken_gap_seconds),
+        "min_unspoken_gap_seconds": float(effective_min_gap),
         "curve": curve,
         "merged_speech_windows": merged,
         "transition_count": len(merged) * 2,
@@ -239,7 +274,33 @@ def build_ducking_envelope(
         "unspoken_frame_fraction": round(float(np.mean(unspoken_mask)), 4),
         "min_gain": round(float(np.min(env)), 4),
         "max_gain": round(float(np.max(env)), 4),
+        "prevents_100pct_return": bool(unspoken_g <= 0.35),
     }
+
+
+def apply_boundary_audio_fade(samples, sample_rate=RATE, *, fade_in_seconds=0.0, fade_out_seconds=0.40):
+    """Apply smooth raised-cosine fade-in at clip start and fade-out at clip end to prevent abrupt boundary cuts."""
+    arr = np.asarray(samples, dtype=np.float32).copy()
+    n_frames = arr.shape[0] if arr.ndim >= 1 else 0
+    if n_frames == 0:
+        return arr
+    fi_frames = min(n_frames // 2, max(0, int(round(float(fade_in_seconds or 0.0) * sample_rate))))
+    fo_frames = min(n_frames // 2, max(0, int(round(float(fade_out_seconds or 0.0) * sample_rate))))
+    if fi_frames > 0:
+        t = np.linspace(0.0, 1.0, fi_frames, endpoint=False, dtype=np.float32)
+        w = (0.5 * (1.0 - np.cos(np.pi * t))).astype(np.float32)
+        if arr.ndim == 2:
+            arr[:fi_frames] *= w[:, None]
+        else:
+            arr[:fi_frames] *= w
+    if fo_frames > 0:
+        t = np.linspace(0.0, 1.0, fo_frames, endpoint=False, dtype=np.float32)
+        w = (0.5 * (1.0 + np.cos(np.pi * t))).astype(np.float32)
+        if arr.ndim == 2:
+            arr[n_frames - fo_frames :] *= w[:, None]
+        else:
+            arr[n_frames - fo_frames :] *= w
+    return arr
 
 
 def _dsp_spectral_separate_ambient(samples, sample_rate=RATE, *, vocal_suppression_db=18.0):
@@ -505,20 +566,54 @@ def verify_audio_loudness_and_clipping(
     unspoken_rms = float(np.sqrt(np.mean(np.square(mix_mono[unspoken_mask])))) if np.any(unspoken_mask) else 0.0
 
     bg_speech_rms = None
+    bg_unspoken_rms = None
     src_speech_rms = None
+    src_unspoken_rms = None
     measured_duck_ratio = None
+    measured_duck_ratio_unspoken = None
+    max_bg_jump_db = 0.0
+    continuous_ducking_verified = None
+
     if background_samples is not None:
         bg_arr = np.asarray(background_samples, dtype=np.float64)
         bg_mono = np.mean(bg_arr, axis=1) if bg_arr.ndim == 2 else bg_arr
-        if len(bg_mono) == n_frames and np.any(speech_mask):
-            bg_speech_rms = float(np.sqrt(np.mean(np.square(bg_mono[speech_mask]))))
+        if len(bg_mono) == n_frames:
+            if np.any(speech_mask):
+                bg_speech_rms = float(np.sqrt(np.mean(np.square(bg_mono[speech_mask]))))
+            if np.any(unspoken_mask):
+                bg_unspoken_rms = float(np.sqrt(np.mean(np.square(bg_mono[unspoken_mask]))))
+
     if source_samples is not None:
         src_arr = np.asarray(source_samples, dtype=np.float64)
         src_mono = np.mean(src_arr, axis=1) if src_arr.ndim == 2 else src_arr
-        if len(src_mono) == n_frames and np.any(speech_mask):
-            src_speech_rms = float(np.sqrt(np.mean(np.square(src_mono[speech_mask]))))
-            if bg_speech_rms is not None and src_speech_rms > 1e-7:
-                measured_duck_ratio = round(bg_speech_rms / src_speech_rms, 4)
+        if len(src_mono) == n_frames:
+            if np.any(speech_mask):
+                src_speech_rms = float(np.sqrt(np.mean(np.square(src_mono[speech_mask]))))
+                if bg_speech_rms is not None and src_speech_rms > 1e-7:
+                    measured_duck_ratio = round(bg_speech_rms / src_speech_rms, 4)
+            if np.any(unspoken_mask):
+                src_unspoken_rms = float(np.sqrt(np.mean(np.square(src_mono[unspoken_mask]))))
+                if bg_unspoken_rms is not None and src_unspoken_rms > 1e-7:
+                    measured_duck_ratio_unspoken = round(bg_unspoken_rms / src_unspoken_rms, 4)
+
+            if background_samples is not None and len(bg_mono) == n_frames:
+                win_len = max(1, int(round(0.25 * sample_rate)))
+                win_ratios = []
+                for w_i in range(0, n_frames, win_len):
+                    s_slice = src_mono[w_i : w_i + win_len]
+                    b_slice = bg_mono[w_i : w_i + win_len]
+                    s_r = float(np.sqrt(np.mean(np.square(s_slice))))
+                    if s_r > 1e-5:
+                        b_r = float(np.sqrt(np.mean(np.square(b_slice))))
+                        win_ratios.append(max(1e-5, b_r / s_r))
+                if len(win_ratios) >= 2:
+                    jumps = [
+                        abs(20.0 * math.log10(win_ratios[k + 1] / win_ratios[k]))
+                        for k in range(len(win_ratios) - 1)
+                    ]
+                    max_bg_jump_db = round(max(jumps), 3)
+                if win_ratios:
+                    continuous_ducking_verified = bool(max(win_ratios) <= 0.30)
 
     return {
         "peak_amplitude": round(peak_val, 6),
@@ -533,7 +628,11 @@ def verify_audio_loudness_and_clipping(
         "unspoken_interval_rms": round(unspoken_rms, 6),
         "unspoken_interval_dbfs": _dbfs(unspoken_rms) if unspoken_rms > 0 else None,
         "background_during_speech_rms": round(bg_speech_rms, 6) if bg_speech_rms is not None else None,
+        "background_unspoken_rms": round(bg_unspoken_rms, 6) if bg_unspoken_rms is not None else None,
         "measured_duck_ratio_during_speech": measured_duck_ratio,
+        "measured_duck_ratio_unspoken": measured_duck_ratio_unspoken,
+        "max_background_gain_jump_db": max_bg_jump_db,
+        "continuous_ducking_verified": continuous_ducking_verified,
         "clipping_free": clipped_count == 0 and peak_val < 1.0,
     }
 
@@ -676,13 +775,20 @@ def attach_speaker_evidence(plan, analysis_path):
 
 def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *, seconds=30,
                mode="japanese-only", diagnostic=False, extend_to_fit=False, reference_gain=.12, max_timing_shift=0,
-               unspoken_gain=1.0, fade_out_seconds=.18, fade_in_seconds=.25, ambient_backend="auto", ambient_gain=.85):
+               unspoken_gain=1.0, fade_out_seconds=.18, fade_in_seconds=.25, release_seconds=None,
+               ducking_style="dynamic", ambient_backend="auto", ambient_gain=.85):
     number(max_timing_shift, "maximum timing shift")
     if max_timing_shift > 2:raise ValueError("Maximum timing shift is limited to 2 seconds.")
     number(seconds, "seconds", positive=True)
     number(reference_gain, "reference gain")
     if reference_gain > .5 or mode not in VALID_MIX_MODES:
         raise ValueError("Invalid mode or reference gain (allowed 0..0.5).")
+    if mode == "continuous-voiceover":
+        ducking_style = "continuous"
+    elif mode == "long-release-voiceover":
+        ducking_style = "long-release"
+    if ducking_style not in VALID_DUCKING_STYLES:
+        raise ValueError(f"Invalid ducking_style: {ducking_style!r}")
     feedback, rows, selection, script_path = validate_feedback(feedback_path, selection_path, video_id)
     metadata = read_json(info_path)
     if metadata.get("id") != video_id:
@@ -758,21 +864,23 @@ def build_plan(feedback_path, selection_path, video_path, info_path, video_id, *
     if same: quality += "_conflicts"
     if missing or excluded: quality += "_partial"
 
+    eff_fade_in = float(release_seconds) if release_seconds is not None else float(fade_in_seconds)
     if mode == "japanese-only":
         policy = "muted"
     elif mode == "reference-mix":
         policy = "quiet English reference; no speech separation"
-    elif mode in ("voiceover", "ducking"):
-        policy = f"dynamic voice-over ducking (speech={reference_gain:.2f}, unspoken={unspoken_gain:.2f})"
+    elif mode in ("voiceover", "ducking", "continuous-voiceover", "long-release-voiceover"):
+        policy = f"{ducking_style} voice-over ducking (speech={reference_gain:.2f}, unspoken={unspoken_gain:.2f})"
     else:
         policy = f"separated ambient preservation ({ambient_backend}, ambient_gain={ambient_gain:.2f}, duck_gain={reference_gain:.2f})"
 
     extra_phase13 = {}
-    if mode in ("voiceover", "ducking", "ambient", "hybrid-ambient"):
+    if mode in ("voiceover", "ducking", "continuous-voiceover", "long-release-voiceover", "ambient", "hybrid-ambient"):
         extra_phase13 = {
+            "ducking_style": str(ducking_style),
             "unspoken_gain": float(unspoken_gain),
             "fade_out_seconds": float(fade_out_seconds),
-            "fade_in_seconds": float(fade_in_seconds),
+            "fade_in_seconds": eff_fade_in,
             "ambient_backend": str(ambient_backend),
             "ambient_gain": float(ambient_gain),
         }
@@ -912,7 +1020,7 @@ def render_plan(plan, output_dir):
                 if len(reference) != len(japanese): raise ValueError("Reference track duration mismatch.")
                 reference = array("f", (v * plan["reference_gain"] for v in reference))
                 final = add_audio([japanese, reference])
-            elif plan["mode"] in ("voiceover", "ducking", "ambient", "hybrid-ambient"):
+            elif plan["mode"] in ("voiceover", "ducking", "continuous-voiceover", "long-release-voiceover", "ambient", "hybrid-ambient"):
                 data = ffmpeg(["-ss", str(plan["absolute_video_start"]), "-i", source,
                                "-t", str(plan["duration_seconds"]), "-map", "0:a:0", "-vn",
                                "-af", f"aresample={RATE},apad=whole_len={plan['sample_frames']}",
@@ -934,6 +1042,7 @@ def render_plan(plan, output_dir):
                     unspoken_gain=float(plan.get("unspoken_gain", 1.0)),
                     fade_out_seconds=float(plan.get("fade_out_seconds", 0.18)),
                     fade_in_seconds=float(plan.get("fade_in_seconds", 0.25)),
+                    ducking_style=plan.get("ducking_style", "dynamic"),
                 )
                 if plan["mode"] in ("ambient", "hybrid-ambient"):
                     sep = separate_ambient_and_speech(
@@ -947,11 +1056,10 @@ def render_plan(plan, output_dir):
                     }
                     amb_gain = float(plan.get("ambient_gain", 0.85))
                     residual_voice_gain = float(plan.get("reference_gain", 0.12)) if plan["mode"] == "hybrid-ambient" else float(plan.get("reference_gain", 0.12)) * 0.35
-                    # During speech: separated ambient bed + ducked residual voice; during non-speech: smooth transition to original audio
                     speech_weight = (float(plan.get("unspoken_gain", 1.0)) - env) / max(1e-6, abs(float(plan.get("unspoken_gain", 1.0)) - float(plan.get("reference_gain", 0.12))))
                     speech_weight = np.clip(speech_weight, 0.0, 1.0)[:, None]
                     bg_during_speech = sep["ambient"] * amb_gain + sep["speech"] * residual_voice_gain
-                    bg_unspoken = src_stereo * float(plan.get("unspoken_gain", 1.0))
+                    bg_unspoken = src_stereo * float(ducking_report.get("unspoken_gain", plan.get("unspoken_gain", 1.0)))
                     bg_stereo = speech_weight * bg_during_speech + (1.0 - speech_weight) * bg_unspoken
                 else:
                     bg_stereo = src_stereo * env[:, None]
@@ -980,7 +1088,6 @@ def render_plan(plan, output_dir):
             verification = validate_mp4(temp / video_name, plan["duration_seconds"])
             if float(verification["probe"]["format"]["duration"]) > plan["clip"]["end"] - plan["clip"]["start"] + 1e-6:
                 raise ValueError("Encoded video frame boundary exceeds selection; output not published.")
-            # Inputs must remain consistent throughout rendering.
             if sha256_file(source) != plan["inputs"]["source_video_sha256"]:
                 raise ValueError("Source video changed during rendering.")
             for row in plan["placements"]:
@@ -1000,7 +1107,7 @@ def render_plan(plan, output_dir):
             atomic_json(temp / "mix_report.json", result, overwrite=False)
             os.rename(temp, target)
         finally:
-            if temp.exists(): shutil.rmtree(temp)  # Only unpublished files created by this call.
+            if temp.exists(): shutil.rmtree(temp)
     return target / "mix_report.json", False
 
 
@@ -1015,10 +1122,12 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--seconds", type=float, default=30)
     parser.add_argument("--mode", choices=VALID_MIX_MODES, default="japanese-only")
+    parser.add_argument("--ducking-style", choices=VALID_DUCKING_STYLES, default="dynamic", help="Ducking envelope behavior: dynamic, continuous (15-20% whole video), or long-release (>=1.5s)")
     parser.add_argument("--reference-gain", "--duck-gain", dest="reference_gain", type=float, default=.12)
     parser.add_argument("--unspoken-gain", type=float, default=1.0, help="Original audio gain during non-TTS intervals in voiceover/ambient modes")
     parser.add_argument("--fade-out-seconds", type=float, default=.18, help="Ducking fade-out duration before TTS starts")
     parser.add_argument("--fade-in-seconds", type=float, default=.25, help="Ducking fade-in duration after TTS ends")
+    parser.add_argument("--release-seconds", type=float, default=None, help="Optional release time override after TTS ends (e.g. >=1.5s)")
     parser.add_argument("--ambient-backend", choices=("auto", "dsp", "demucs", "torchscript", "convtasnet", "none"), default="auto")
     parser.add_argument("--ambient-gain", type=float, default=.85)
     parser.add_argument("--diagnostic", action="store_true", help="Explicitly allow reported collisions and undubbed/review entries")
@@ -1034,6 +1143,7 @@ def main(argv=None):
                           args.video_id, seconds=args.seconds, mode=args.mode, diagnostic=args.diagnostic,
                           extend_to_fit=args.extend_to_fit, reference_gain=args.reference_gain, max_timing_shift=args.max_timing_shift,
                           unspoken_gain=args.unspoken_gain, fade_out_seconds=args.fade_out_seconds, fade_in_seconds=args.fade_in_seconds,
+                          release_seconds=args.release_seconds, ducking_style=args.ducking_style,
                           ambient_backend=args.ambient_backend, ambient_gain=args.ambient_gain)
         if args.speaker_analysis:
             attach_speaker_evidence(plan, args.speaker_analysis)
