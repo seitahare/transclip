@@ -498,5 +498,140 @@ class TestPhase132Improvements(unittest.TestCase):
                 self.assertEqual(generate_calls[-1]["speaker"], "Uncle_Fu")
 
 
+
+    def test_post_tts_auto_extend_clip_handles_clone_and_preset_utterance_61(self):
+        """Regression test for Utterance 61 clip boundary overflow in Clone (8.16s -> 1874.66) and Preset (8.24s -> 1874.74)."""
+        import tempfile
+        import wave
+        import numpy as np
+        from dubbing_pipeline import (
+            _fallback_mix_audio_and_video,
+            analyze_timeline_collisions_and_overlaps,
+            ensure_30s_verification_video,
+            resolve_post_tts_clip_extension,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            sr = 24000
+            for label, wav_dur, expected_end in (
+                ("clone", 8.16, 1874.66),
+                ("preset", 8.24, 1874.74),
+            ):
+                wav_path = tmp_dir / f"utt61_{label}.wav"
+                n_samples = int(round(wav_dur * sr))
+                t = np.arange(n_samples, dtype=np.float32) / float(sr)
+                sig = (0.25 * np.sin(2.0 * np.pi * 135.0 * t) * 32767.0).astype("<i2")
+                with wave.open(str(wav_path), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sr)
+                    wf.writeframes(sig.tobytes())
+
+                entries = [
+                    {
+                        "id": "61",
+                        "speaker": "SPEAKER_01",
+                        "start": 1866.50,
+                        "end": 1874.30,
+                        "source_start": 1866.50,
+                        "source_end": 1874.30,
+                        "text_ja": "ロボットはいわばエンドエフェクターで、局所的な知能を持ちつつ大規模AIモデルに管理される形になる。",
+                        "audio_file": str(wav_path),
+                        "generation_status": "complete",
+                    }
+                ]
+                tl = analyze_timeline_collisions_and_overlaps(
+                    entries,
+                    selection_start=1836.45,
+                    selection_end=1874.65,
+                    auto_tempo_adjust=True,
+                    min_atempo=1.0,
+                    max_atempo=1.20,
+                    allow_slowdown=False,
+                    smooth_intra_speaker_rates=True,
+                    adjusted_wav_dir=tmp_dir / f"adj_{label}",
+                    auto_extend_clip=True,
+                    max_clip_extension_seconds=12.0,
+                    source_video_duration=1915.0,
+                )
+                ext = resolve_post_tts_clip_extension(
+                    feedback_entries=entries,
+                    placements_map=tl["placements"],
+                    selection_start=1836.45,
+                    selection_end=1874.65,
+                    requested_selection_end=1871.0,
+                    auto_extend_clip=True,
+                    max_clip_extension_seconds=12.0,
+                    source_video_duration=1915.0,
+                )
+                self.assertTrue(ext["extension_applied"])
+                self.assertAlmostEqual(ext["effective_selection_end"], expected_end, places=2)
+                self.assertAlmostEqual(tl["placements"]["61"]["applied_atempo"], 1.0, places=3)
+
+                vid_path = ensure_30s_verification_video(
+                    tmp_dir / f"src_{label}.mp4",
+                    duration_seconds=ext["effective_clip_duration"],
+                )
+                _, mix_rep = _fallback_mix_audio_and_video(
+                    video_path=vid_path,
+                    feedback_doc={"entries": entries},
+                    placements_map=tl["placements"],
+                    selection_start=1836.45,
+                    clip_duration=ext["effective_clip_duration"],
+                    output_dir=tmp_dir / f"mix_{label}",
+                )
+                self.assertAlmostEqual(
+                    mix_rep["clip_duration_seconds"],
+                    round(expected_end - 1836.45, 4),
+                    places=2,
+                )
+
+    def test_post_tts_auto_extend_clip_raises_when_exceeding_source_video_duration(self):
+        """Extending beyond source_video_duration must raise a clear ValueError."""
+        from dubbing_pipeline import resolve_post_tts_clip_extension
+
+        entries = [{"id": "61", "generation_status": "complete"}]
+        placements = {
+            "61": {
+                "placement_start_seconds": 1866.50,
+                "placement_end_seconds": 1874.74,
+                "clip_relative_start_seconds": 30.05,
+                "clip_relative_end_seconds": 38.29,
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "exceeds source video duration"):
+            resolve_post_tts_clip_extension(
+                feedback_entries=entries,
+                placements_map=placements,
+                selection_start=1836.45,
+                selection_end=1874.65,
+                auto_extend_clip=True,
+                source_video_duration=1874.70,
+            )
+
+    def test_post_tts_no_auto_extend_clip_refuses_truncation(self):
+        """When auto_extend_clip=False, overflowing TTS WAV must refuse truncation with ValueError."""
+        from dubbing_pipeline import resolve_post_tts_clip_extension
+
+        entries = [{"id": "61", "generation_status": "complete"}]
+        placements = {
+            "61": {
+                "placement_start_seconds": 1866.50,
+                "placement_end_seconds": 1874.74,
+                "clip_relative_start_seconds": 30.05,
+                "clip_relative_end_seconds": 38.29,
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "Full WAV for utterance 61 exceeds the selected clip; truncation refused"):
+            resolve_post_tts_clip_extension(
+                feedback_entries=entries,
+                placements_map=placements,
+                selection_start=1836.45,
+                selection_end=1874.65,
+                auto_extend_clip=False,
+                source_video_duration=1915.0,
+            )
+
 if __name__ == "__main__":
     unittest.main()

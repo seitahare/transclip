@@ -1879,6 +1879,9 @@ def analyze_timeline_collisions_and_overlaps(
     use_word_level_sync=False,
     sync_anchor="adaptive",
     long_pause_threshold=0.55,
+    auto_extend_clip=False,
+    max_clip_extension_seconds=12.0,
+    source_video_duration=None,
 ):
     """Detect same-speaker collisions & inter-speaker overlaps, measure overflows,
     align semantic clause units (and word-level speech clusters), apply bounded
@@ -1902,6 +1905,16 @@ def analyze_timeline_collisions_and_overlaps(
 
     slowdown_allowed = (float(min_atempo) < 1.0) if allow_slowdown is None else bool(allow_slowdown)
     effective_min_atempo = max(0.5, min(1.0, float(min_atempo))) if slowdown_allowed else 1.0
+    clip_end_barrier = float(selection_end)
+    if auto_extend_clip:
+        ext_limit = float(selection_end) + max(0.0, float(max_clip_extension_seconds or 0.0))
+        if source_video_duration is not None and float(source_video_duration) > 0.0:
+            ext_limit = min(ext_limit, float(source_video_duration))
+        clip_end_barrier = max(clip_end_barrier, ext_limit)
+    max_src_start = max(
+        (float(r.get("source_start", r.get("start", 0.0))) for r in entries),
+        default=0.0,
+    )
 
     norm_entries = []
     duration_adjustments = []
@@ -1961,8 +1974,12 @@ def analyze_timeline_collisions_and_overlaps(
         slot_dur = effective_slot_dur
         did_trim_edge = False
 
+        is_trailing_utterance = abs(src_start - max_src_start) <= 1e-3
+        can_auto_extend_trailing = bool(
+            auto_extend_clip and is_trailing_utterance and (place_start + cur_dur) <= clip_end_barrier + 1e-4
+        )
         # Optional non-destructive edge-silence trim when overflowing slot and adjusted_wav_dir is provided
-        if auto_tempo_adjust and adjusted_wav_dir and active_wav and cur_dur > slot_dur:
+        if auto_tempo_adjust and adjusted_wav_dir and active_wav and cur_dur > slot_dur and not can_auto_extend_trailing:
             try:
                 wav_exists = Path(active_wav).is_file()
             except OSError:
@@ -2062,7 +2079,7 @@ def analyze_timeline_collisions_and_overlaps(
                     continue
             except OSError:
                 continue
-            barriers = [float(selection_end)]
+            barriers = [clip_end_barrier]
             downstream_pause = 0.0
             for j in range(i + 1, len(norm_entries)):
                 other = norm_entries[j]
@@ -2224,7 +2241,7 @@ def analyze_timeline_collisions_and_overlaps(
                 needed_shift = running_end - new_start
                 max_allowed_start = min(
                     orig_start + max(0.0, float(max_timing_shift)),
-                    float(selection_end) - item["actual_duration"],
+                    clip_end_barrier - item["actual_duration"],
                 )
                 if orig_start + needed_shift <= max_allowed_start + 1e-4:
                     new_start = orig_start + needed_shift
@@ -2676,16 +2693,163 @@ def run_technical_xvector_feedback(
     return fb_path, fb_doc
 
 
+def resolve_post_tts_clip_extension(
+    *,
+    feedback_entries,
+    placements_map,
+    selection_start,
+    selection_end,
+    requested_selection_end=None,
+    auto_extend_clip=False,
+    max_clip_extension_seconds=12.0,
+    source_video_duration=None,
+    target_sr=48000,
+):
+    """Inspect actual generated TTS WAV placements and auto-extend clip end when `--auto-extend-clip` is enabled."""
+    sel_start = float(selection_start)
+    sel_end = float(selection_end)
+    req_end = float(requested_selection_end) if requested_selection_end is not None else sel_end
+    base_frames = int(round(max(0.0, sel_end - sel_start) * int(target_sr)))
+
+    max_required_end = sel_end
+    max_required_frames = base_frames
+    overflowing_utterance_id = None
+
+    for entry in feedback_entries or []:
+        if entry.get("generation_status") not in (None, "complete"):
+            continue
+        uid = str(entry.get("id"))
+        p_info = placements_map.get(uid) or placements_map.get(entry.get("id"))
+        if p_info is None:
+            continue
+        rel_start = float(
+            p_info.get(
+                "clip_relative_start_seconds",
+                max(0.0, float(p_info.get("placement_start_seconds", sel_start)) - sel_start),
+            )
+        )
+        start_frame = int(round(rel_start * int(target_sr)))
+        placed_end = float(
+            p_info.get(
+                "placement_end_seconds",
+                sel_start + float(p_info.get("clip_relative_end_seconds", rel_start)),
+            )
+        )
+
+        wav_path_str = p_info.get("active_audio_file") or entry.get("audio_file")
+        end_frame = int(round(max(0.0, placed_end - sel_start) * int(target_sr)))
+        if wav_path_str and Path(wav_path_str).is_file():
+            samples, sr = _read_wav_float32(Path(wav_path_str))
+            if sr != int(target_sr) and len(samples) > 1:
+                wav_frames = max(1, int(round(len(samples) * float(target_sr) / float(sr))))
+            else:
+                wav_frames = len(samples)
+            end_frame = max(end_frame, start_frame + wav_frames)
+
+        utt_required_end = max(placed_end, sel_start + (end_frame / float(target_sr)))
+        if end_frame > max_required_frames or utt_required_end > max_required_end + 1e-6:
+            max_required_frames = max(max_required_frames, end_frame)
+            max_required_end = max(max_required_end, utt_required_end)
+            overflowing_utterance_id = uid
+
+    needs_extension = (max_required_frames > base_frames) or (max_required_end > sel_end + 1e-6)
+    if not needs_extension:
+        return {
+            "extension_applied": False,
+            "previous_selection_end": round(sel_end, 4),
+            "effective_selection_end": round(sel_end, 4),
+            "effective_clip_duration": round(sel_end - sel_start, 4),
+            "extended_seconds": 0.0,
+            "trigger_utterance_id": None,
+        }
+
+    min_dur = max(max_required_end - sel_start, max_required_frames / float(target_sr))
+    eff_clip_dur = math.ceil(min_dur * 10000.0 - 1e-9) / 10000.0
+    while int(round(eff_clip_dur * int(target_sr))) < max_required_frames:
+        eff_clip_dur = round(eff_clip_dur + 0.0001, 4)
+    eff_sel_end = round(sel_start + eff_clip_dur, 4)
+
+    if not auto_extend_clip:
+        raise ValueError(f"Full WAV for utterance {overflowing_utterance_id} exceeds the selected clip; truncation refused.")
+
+    if source_video_duration is not None and float(source_video_duration) > 0.0:
+        src_max_end = float(source_video_duration)
+        if eff_sel_end > src_max_end + 1e-4:
+            raise ValueError(
+                f"Cannot auto-extend clip end to {eff_sel_end:.2f}s for utterance {overflowing_utterance_id}: "
+                f"exceeds source video duration ({src_max_end:.2f}s); truncation refused."
+            )
+
+    if max_clip_extension_seconds is not None:
+        total_ext = eff_sel_end - min(req_end, sel_end)
+        if total_ext > float(max_clip_extension_seconds) + 1e-4:
+            raise ValueError(
+                f"Cannot auto-extend clip end to {eff_sel_end:.2f}s for utterance {overflowing_utterance_id}: "
+                f"required extension ({total_ext:.2f}s) exceeds max_clip_extension_seconds "
+                f"({float(max_clip_extension_seconds):.2f}s); truncation refused."
+            )
+
+    return {
+        "extension_applied": True,
+        "previous_selection_end": round(sel_end, 4),
+        "effective_selection_end": eff_sel_end,
+        "effective_clip_duration": round(eff_clip_dur, 4),
+        "extended_seconds": round(eff_sel_end - sel_end, 4),
+        "trigger_utterance_id": overflowing_utterance_id,
+    }
+
+
 def _prepare_clip_video_source(video_path, *, selection_start, clip_duration, work_dir, ffmpeg_bin=None):
     """Ensure the video file matches the `[selection_start, selection_start + clip_duration]` window without modifying `video_path`."""
     src = Path(video_path).resolve()
     probe = probe_media_streams(src)
     dur = float(probe.get("duration_seconds") or 0.0)
+    target_dur = float(clip_duration)
+
+    if 0.0 < dur < target_dur - 1e-3 and (float(selection_start) <= 0.0 or dur < float(selection_start)):
+        pad_sec = max(0.001, target_dur - dur)
+        ext_tag = f"{int(round(float(selection_start) * 100))}_{int(round(target_dur * 10000))}"
+        ext_mp4 = Path(work_dir).resolve() / f"source_extended_{ext_tag}.mp4"
+        if ext_mp4.is_file():
+            return ext_mp4, probe_media_streams(ext_mp4)
+        tmp_ext = ext_mp4.with_suffix(".tmp.mp4")
+        cmd_ext = [
+            ffmpeg_bin or _resolve_binary("ffmpeg"),
+            "-y",
+            "-i",
+            str(src),
+            "-vf",
+            f"tpad=stop_mode=clone:stop_duration={pad_sec:.4f}",
+            "-af",
+            f"apad=pad_dur={pad_sec:.4f}",
+            "-t",
+            f"{target_dur:.4f}",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            str(tmp_ext),
+        ]
+        proc_ext = subprocess.run(cmd_ext, capture_output=True, text=True, check=False)
+        if proc_ext.returncode == 0 and tmp_ext.is_file():
+            tmp_ext.replace(ext_mp4)
+            return ext_mp4, probe_media_streams(ext_mp4)
+        return src, probe
+
     if dur <= float(clip_duration) + 2.0 or float(selection_start) <= 0.0:
         return src, probe
 
-    # Source video is a longer recording; extract the target 30s segment non-destructively into work_dir
-    seg_mp4 = Path(work_dir).resolve() / f"source_segment_{int(selection_start)}_{int(selection_start + clip_duration)}.mp4"
+    # Source video is a longer recording; extract the target segment non-destructively into work_dir
+    seg_tag = f"{int(round(float(selection_start) * 100))}_{int(round((float(selection_start) + target_dur) * 100))}"
+    seg_mp4 = Path(work_dir).resolve() / f"source_segment_{seg_tag}.mp4"
     if seg_mp4.is_file():
         return seg_mp4, probe_media_streams(seg_mp4)
 
@@ -3690,6 +3854,7 @@ def run_phase11_dubbing_pipeline(
     video_fade_out_seconds=0.0,
     auto_rebalance_overlong=False,
     utterance_translations_path=None,
+    source_video_duration=None,
 ):
     """Execute the end-to-end Japanese dubbing pipeline (supporting Phase 11, Phase 12, Phase 13, Phase 13.1, and Phase 13.2 workflows)."""
     root = Path(output_dir).resolve()
@@ -3891,9 +4056,22 @@ def run_phase11_dubbing_pipeline(
         evaluate_speaker_voice_consistency,
     )
 
+    initial_requested_selection_end = selection_end
     raw_video_probe_initial = probe_media_streams(raw_video_file) if raw_video_file.is_file() else {}
     raw_video_dur = float(raw_video_probe_initial.get("duration_seconds") or 0.0)
-    avail_source_dur = raw_video_dur if raw_video_dur >= selection_end else None
+    explicit_src_dur = source_video_duration
+    if explicit_src_dur is None and isinstance(raw_script_doc, dict):
+        explicit_src_dur = raw_script_doc.get("source_video_duration") or (
+            raw_script_doc.get("selection_range", {}).get("source_video_duration")
+            if isinstance(raw_script_doc.get("selection_range"), dict)
+            else None
+        )
+    if explicit_src_dur is not None:
+        avail_source_dur = float(explicit_src_dur)
+    elif raw_video_dur > 0.0 and (selection_start <= 0.0 or raw_video_dur >= selection_end):
+        avail_source_dur = raw_video_dur
+    else:
+        avail_source_dur = None
 
     clip_boundary_resolution = detect_and_resolve_clip_boundaries(
         source_rows if source_rows is not None else norm_script["utterances"],
@@ -4281,7 +4459,42 @@ def run_phase11_dubbing_pipeline(
         use_word_level_sync=use_word_level_sync,
         sync_anchor=sync_anchor,
         long_pause_threshold=long_pause_threshold,
+        auto_extend_clip=bool(auto_extend_clip),
+        max_clip_extension_seconds=max_clip_extension_seconds,
+        source_video_duration=avail_source_dur,
     )
+    post_tts_extension = resolve_post_tts_clip_extension(
+        feedback_entries=feedback_doc.get("entries", []),
+        placements_map=timeline_analysis["placements"],
+        selection_start=selection_start,
+        selection_end=selection_end,
+        requested_selection_end=initial_requested_selection_end,
+        auto_extend_clip=bool(auto_extend_clip),
+        max_clip_extension_seconds=max_clip_extension_seconds,
+        source_video_duration=avail_source_dur,
+    )
+    if post_tts_extension["extension_applied"]:
+        selection_end = post_tts_extension["effective_selection_end"]
+        clip_duration = post_tts_extension["effective_clip_duration"]
+        clip_boundary_resolution["extension_applied"] = True
+        clip_boundary_resolution["clip_was_extended"] = True
+        clip_boundary_resolution["effective_clip_end"] = selection_end
+        clip_boundary_resolution["effective_clip_duration"] = clip_duration
+        clip_boundary_resolution["effective_selection"] = {
+            "start": selection_start,
+            "end": selection_end,
+            "duration": clip_duration,
+        }
+        clip_boundary_resolution["post_tts_extension"] = post_tts_extension
+        working_script_doc["selection_range"] = {"start": selection_start, "end": selection_end}
+        _atomic_write_json(working_script_path, working_script_doc)
+        did_modify_script = True
+        video_file, source_video_probe = _prepare_clip_video_source(
+            raw_video_file,
+            selection_start=selection_start,
+            clip_duration=clip_duration,
+            work_dir=work_dir,
+        )
     unresolved = timeline_analysis["unresolved_same_speaker_collisions"]
     if unresolved and not allow_diagnostic_on_collision:
         raise RuntimeError(
