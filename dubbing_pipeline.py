@@ -87,6 +87,7 @@ class TechnicalVoiceReference:
         reference_text=None,
         preset_voice=None,
         extracted_segments=None,
+        reference_quality=None,
     ):
         spk = str(speaker_id or "").strip()
         if not spk or spk.upper() in ("NULL", "NONE", "UNKNOWN"):
@@ -120,6 +121,8 @@ class TechnicalVoiceReference:
         self.preset_voice = preset_voice
         self.extracted_segments = list(extracted_segments or [])
         self.profile_fingerprint = fingerprint
+        self.voice_profile_id = f"vp-{spk}-{audio_sha[:12]}"
+        self.reference_quality = reference_quality
 
     def technical_snapshot(self):
         """Verify on-disk WAV SHA-256 integrity and return snapshot dictionary for QwenProsodyCloneSynthesizer."""
@@ -138,6 +141,7 @@ class TechnicalVoiceReference:
     def to_metadata(self):
         return {
             "speaker_id": self.speaker_id,
+            "voice_profile_id": self.voice_profile_id,
             "reference_audio": self.reference_audio,
             "reference_audio_sha256": self.reference_audio_sha256,
             "duration_seconds": self.duration_seconds,
@@ -145,6 +149,7 @@ class TechnicalVoiceReference:
             "source_origin": self.source_origin,
             "profile_fingerprint": self.profile_fingerprint,
             "extracted_segments": self.extracted_segments,
+            "reference_quality": self.reference_quality,
         }
 
 
@@ -1372,11 +1377,24 @@ def extract_speaker_reference_from_video(
         stream.setframerate(target_sr)
         stream.writeframes(pcm.tobytes())
 
+    ref_quality = None
+    try:
+        from voice_consistency import inspect_reference_audio_quality
+
+        has_overlap_fallback = any(bool(s.get("fallback_overlapped_segment")) for s in used_segments)
+        ref_quality = inspect_reference_audio_quality(
+            ref_wav_path,
+            has_overlap_with_other_speaker=has_overlap_fallback,
+        )
+    except Exception:
+        ref_quality = None
+
     return TechnicalVoiceReference(
         speaker_id=speaker_id,
         reference_audio=ref_wav_path,
         source_origin="source_video_extracted",
         extracted_segments=used_segments,
+        reference_quality=ref_quality,
     )
 
 
@@ -1728,15 +1746,19 @@ def probe_media_streams(mp4_path, *, ffprobe_bin=None):
     }
 
 
-def _trim_wav_silence_non_destructive(wav_path, output_dir, *, utterance_id, margin_seconds=0.025):
-    """Trim excess leading/trailing silence into a new file in `output_dir`, never modifying `wav_path`."""
+def _trim_wav_silence_non_destructive(wav_path, output_dir, *, utterance_id, margin_seconds=0.045):
+    """Trim excess leading/trailing silence into a new file in `output_dir`, never modifying `wav_path`.
+
+    Keeps a 45ms margin and applies a 10ms raised-cosine micro-fade at trimmed edges to prevent onset
+    distortion or boundary click noise on short utterances.
+    """
     samples, rate = _read_wav_float32(wav_path)
     orig_dur = len(samples) / float(rate)
     if len(samples) < int(0.2 * rate):
         return Path(wav_path), orig_dur, orig_dur, False
 
     peak = float(np.max(np.abs(samples)))
-    thr = max(0.003, peak * 0.025)
+    thr = max(0.003, peak * 0.022)
     active_idx = np.where(np.abs(samples) >= thr)[0]
     if len(active_idx) == 0:
         return Path(wav_path), orig_dur, orig_dur, False
@@ -1744,10 +1766,19 @@ def _trim_wav_silence_non_destructive(wav_path, output_dir, *, utterance_id, mar
     margin_frames = int(round(margin_seconds * rate))
     start_f = max(0, int(active_idx[0]) - margin_frames)
     end_f = min(len(samples), int(active_idx[-1]) + 1 + margin_frames)
-    trimmed = samples[start_f:end_f]
+    trimmed = samples[start_f:end_f].copy()
     new_dur = len(trimmed) / float(rate)
     if (orig_dur - new_dur) < 0.04 or new_dur < 0.15:
         return Path(wav_path), orig_dur, orig_dur, False
+
+    fade_frames = min(int(round(0.010 * rate)), len(trimmed) // 8)
+    if fade_frames >= 4:
+        t_fade = np.linspace(0.0, 1.0, fade_frames, dtype=np.float32)
+        ramp = 0.5 * (1.0 - np.cos(np.pi * t_fade))
+        if start_f > 0:
+            trimmed[:fade_frames] *= ramp
+        if end_f < len(samples):
+            trimmed[-fade_frames:] *= ramp[::-1]
 
     out_d = Path(output_dir).resolve()
     out_d.mkdir(parents=True, exist_ok=True)
@@ -1770,27 +1801,29 @@ def _apply_bounded_atempo_non_destructive(
     target_duration_seconds,
     min_atempo=1.0,
     max_atempo=1.25,
+    exact_atempo_ratio=None,
     ffmpeg_bin=None,
 ):
-    """Apply bounded FFmpeg `atempo` time-stretching (supporting 0.90..1.30x bidirectional slot fitting)
-    into a new file in `output_dir`, never modifying `wav_path`.
-    """
+    """Apply bounded FFmpeg `atempo` time-stretching into a new file in `output_dir`, never modifying `wav_path`."""
     samples, rate = _read_wav_float32(wav_path)
     cur_dur = len(samples) / float(rate)
-    if target_duration_seconds <= 0.05:
+    if target_duration_seconds <= 0.05 and exact_atempo_ratio is None:
         return Path(wav_path), round(cur_dur, 4), 1.0, False
 
     from timing_adjustment import compute_auto_speech_rate_ratio
     eff_min = max(0.5, min(1.0, float(min_atempo)))
     eff_max = max(1.0, min(2.0, float(max_atempo)))
-    rate_plan = compute_auto_speech_rate_ratio(
-        cur_dur,
-        target_duration_seconds,
-        min_atempo=eff_min,
-        max_atempo=eff_max,
-        deadband=0.015,
-    )
-    applied_ratio = float(rate_plan["applied_atempo"])
+    if exact_atempo_ratio is not None:
+        applied_ratio = max(eff_min, min(eff_max, float(exact_atempo_ratio)))
+    else:
+        rate_plan = compute_auto_speech_rate_ratio(
+            cur_dur,
+            target_duration_seconds,
+            min_atempo=eff_min,
+            max_atempo=eff_max,
+            deadband=0.015,
+        )
+        applied_ratio = float(rate_plan["applied_atempo"])
     if abs(applied_ratio - 1.0) <= 0.015:
         return Path(wav_path), round(cur_dur, 4), 1.0, False
 
@@ -1838,21 +1871,49 @@ def analyze_timeline_collisions_and_overlaps(
     min_atempo=0.90,
     max_atempo=1.25,
     fit_utterance_slots=False,
+    allow_slowdown=None,
+    smooth_intra_speaker_rates=False,
     adjusted_wav_dir=None,
     source_utterances=None,
     word_timestamps=None,
     use_word_level_sync=False,
     sync_anchor="adaptive",
     long_pause_threshold=0.55,
+    auto_extend_clip=False,
+    max_clip_extension_seconds=12.0,
+    source_video_duration=None,
 ):
     """Detect same-speaker collisions & inter-speaker overlaps, measure overflows,
-    align semantic clause units (and word-level speech clusters), apply bounded 0.90..1.30x
+    align semantic clause units (and word-level speech clusters), apply bounded
     tempo & timing adjustments, and detect timing/silence/truncation anomalies.
+
+    Phase 13.2 enhancement:
+    - When `allow_slowdown=False` (or `min_atempo >= 1.0`), automatic slowdown (`atempo < 1.0`)
+      is strictly prohibited so short utterances never get stretched/warbled; they play at `1.00x`
+      and leave a natural trailing pause.
+    - When `smooth_intra_speaker_rates=True`, adjacent same-speaker speaking rates are smoothed
+      (`max_adjacent_delta <= 0.12x`) before applying a single FFmpeg `atempo` pass.
     """
     from timing_adjustment import (
         align_semantic_units_to_utterance_window,
+        compute_auto_speech_rate_ratio,
         detect_timing_and_coverage_anomalies,
+        plan_overlong_tts_resolution,
+        smooth_intra_speaker_speaking_rates,
         split_utterance_on_long_pauses_and_align_clauses,
+    )
+
+    slowdown_allowed = (float(min_atempo) < 1.0) if allow_slowdown is None else bool(allow_slowdown)
+    effective_min_atempo = max(0.5, min(1.0, float(min_atempo))) if slowdown_allowed else 1.0
+    clip_end_barrier = float(selection_end)
+    if auto_extend_clip:
+        ext_limit = float(selection_end) + max(0.0, float(max_clip_extension_seconds or 0.0))
+        if source_video_duration is not None and float(source_video_duration) > 0.0:
+            ext_limit = min(ext_limit, float(source_video_duration))
+        clip_end_barrier = max(clip_end_barrier, ext_limit)
+    max_src_start = max(
+        (float(r.get("source_start", r.get("start", 0.0))) for r in entries),
+        default=0.0,
     )
 
     norm_entries = []
@@ -1893,6 +1954,7 @@ def analyze_timeline_collisions_and_overlaps(
             })
 
         wav_file = row.get("audio_file")
+        raw_wav_file = row.get("raw_audio_file") or wav_file
         raw_dur = float(
             row.get(
                 "actual_tts_duration_seconds",
@@ -1910,9 +1972,14 @@ def analyze_timeline_collisions_and_overlaps(
         active_wav = str(wav_file) if wav_file else None
         cur_dur = raw_dur
         slot_dur = effective_slot_dur
+        did_trim_edge = False
 
+        is_trailing_utterance = abs(src_start - max_src_start) <= 1e-3
+        can_auto_extend_trailing = bool(
+            auto_extend_clip and is_trailing_utterance and (place_start + cur_dur) <= clip_end_barrier + 1e-4
+        )
         # Optional non-destructive edge-silence trim when overflowing slot and adjusted_wav_dir is provided
-        if auto_tempo_adjust and adjusted_wav_dir and active_wav and cur_dur > slot_dur:
+        if auto_tempo_adjust and adjusted_wav_dir and active_wav and cur_dur > slot_dur and not can_auto_extend_trailing:
             try:
                 wav_exists = Path(active_wav).is_file()
             except OSError:
@@ -1926,6 +1993,7 @@ def analyze_timeline_collisions_and_overlaps(
                 if did_trim:
                     active_wav = str(trimmed_p)
                     cur_dur = trim_d
+                    did_trim_edge = True
                     duration_adjustments.append(
                         {
                             "id": str(row.get("id", f"utt-{idx + 1:03d}")),
@@ -1957,14 +2025,20 @@ def analyze_timeline_collisions_and_overlaps(
                 "word_timing_analysis": wt_analysis,
                 "slot_duration": round(slot_dur, 4),
                 "raw_tts_duration": round(raw_dur, 4),
+                "trimmed_tts_duration": round(cur_dur, 4),
+                "trim_applied": did_trim_edge,
+                "resampling_count": 0,
+                "applied_atempo": 1.0,
                 "slot_overflow_seconds": round(max(0.0, cur_dur - slot_dur), 4),
                 "placement_start": place_start,
                 "actual_duration": cur_dur,
                 "placement_end": place_start + cur_dur,
+                "raw_audio_file": str(raw_wav_file) if raw_wav_file else None,
                 "original_audio_file": str(wav_file) if wav_file else None,
                 "active_audio_file": active_wav,
                 "semantic_units": semantic_units,
                 "sync_anchor_used": "content_start" if (use_word_level_sync and sync_anchor != "start") else "raw_start",
+                "overlong_resolution_plan": None,
             }
         )
 
@@ -1994,7 +2068,9 @@ def analyze_timeline_collisions_and_overlaps(
                 )
 
     # Optional bounded non-destructive atempo when auto_tempo_adjust=True
+    intra_speaker_rate_smoothing = None
     if auto_tempo_adjust and adjusted_wav_dir:
+        planned_tempo_actions = {}
         for i, item in enumerate(norm_entries):
             if not item["active_audio_file"]:
                 continue
@@ -2003,42 +2079,119 @@ def analyze_timeline_collisions_and_overlaps(
                     continue
             except OSError:
                 continue
-            barriers = [float(selection_end)]
+            barriers = [clip_end_barrier]
+            downstream_pause = 0.0
             for j in range(i + 1, len(norm_entries)):
                 other = norm_entries[j]
                 other_anchor = other["effective_content_start"] if use_word_level_sync else other["source_start"]
                 if other["speaker"] == item["speaker"]:
                     barriers.append(other_anchor + float(max_timing_shift))
+                    downstream_pause = max(0.0, other_anchor - item["effective_content_end"])
                     break
                 else:
                     src_ov = min(item["source_end"], other["source_end"]) - max(item["source_start"], other["source_start"])
                     if src_ov <= 0.05 and other["source_start"] >= item["source_start"]:
                         barriers.append(other_anchor + float(max_inter_speaker_shift))
+                        downstream_pause = max(0.0, other_anchor - item["effective_content_end"])
                         break
             avail_span = min(barriers) - item["placement_start"]
-            target_span = min(avail_span, item["slot_duration"]) if fit_utterance_slots else avail_span
+            # When slowdown is prohibited (Phase 13.2), allow absorbing natural downstream pause up to avail_span
+            target_span = (
+                min(avail_span, item["slot_duration"])
+                if (fit_utterance_slots and slowdown_allowed)
+                else min(avail_span, max(item["slot_duration"], avail_span))
+            )
+            if fit_utterance_slots and not slowdown_allowed:
+                # Prefer fitting within slot + up to 0.45s natural pause absorption before speeding up
+                target_span = min(avail_span, item["slot_duration"] + min(0.45, max(0.0, avail_span - item["slot_duration"])))
+
+            overlong_plan = plan_overlong_tts_resolution(
+                item,
+                raw_tts_duration=item["raw_tts_duration"],
+                trimmed_tts_duration=item["trimmed_tts_duration"],
+                slot_duration=item["slot_duration"],
+                downstream_pause_seconds=downstream_pause,
+                max_shift_seconds=float(max_timing_shift),
+                max_atempo=min(1.25, float(max_atempo)),
+            )
+            item["overlong_resolution_plan"] = overlong_plan
+
             needs_speedup = item["actual_duration"] > target_span + 0.02 and target_span >= 0.30
             needs_slowdown = (
-                fit_utterance_slots
-                and float(min_atempo) < 1.0
+                slowdown_allowed
+                and fit_utterance_slots
+                and effective_min_atempo < 1.0
                 and item["actual_duration"] < item["slot_duration"] * 0.88
                 and item["slot_duration"] <= avail_span + 0.01
                 and item["slot_duration"] >= 0.50
             )
+            target_dur = item["slot_duration"] if needs_slowdown else target_span
             if needs_speedup or needs_slowdown:
+                rate_plan = compute_auto_speech_rate_ratio(
+                    item["actual_duration"],
+                    target_dur,
+                    min_atempo=effective_min_atempo if fit_utterance_slots else 1.0,
+                    max_atempo=max_atempo,
+                    deadband=0.015,
+                )
+                planned_ratio = float(rate_plan["applied_atempo"])
+            else:
+                planned_ratio = 1.0
+            planned_tempo_actions[item["id"]] = {
+                "target_dur": target_dur,
+                "avail_span": avail_span,
+                "barriers": barriers,
+                "planned_ratio": planned_ratio,
+                "needs_speedup": needs_speedup,
+                "needs_slowdown": needs_slowdown,
+            }
+
+        if smooth_intra_speaker_rates and planned_tempo_actions:
+            rate_inputs = [
+                {
+                    "id": item["id"],
+                    "speaker": item["speaker"],
+                    "applied_atempo": planned_tempo_actions.get(item["id"], {}).get("planned_ratio", 1.0),
+                    "raw_tts_duration": item["actual_duration"],
+                    "slot_duration": planned_tempo_actions.get(item["id"], {}).get("avail_span", item["slot_duration"]),
+                    "available_shift_seconds": 0.0,
+                }
+                for item in norm_entries
+            ]
+            intra_speaker_rate_smoothing = smooth_intra_speaker_speaking_rates(
+                rate_inputs,
+                max_adjacent_delta=0.12,
+                max_atempo=min(1.25, float(max_atempo)),
+                allow_slowdown=slowdown_allowed,
+            )
+            smoothed_by_id = {str(r["id"]): float(r["applied_atempo"]) for r in intra_speaker_rate_smoothing["entries"]}
+            for uid_k, act in planned_tempo_actions.items():
+                if str(uid_k) in smoothed_by_id:
+                    act["planned_ratio"] = smoothed_by_id[str(uid_k)]
+
+        for i, item in enumerate(norm_entries):
+            act = planned_tempo_actions.get(item["id"])
+            if not act:
+                continue
+            barriers = act["barriers"]
+            ratio_to_apply = float(act["planned_ratio"])
+            if abs(ratio_to_apply - 1.0) > 0.015:
                 adj_wav, adj_dur, ratio, did_tempo = _apply_bounded_atempo_non_destructive(
                     item["active_audio_file"],
                     adjusted_wav_dir,
                     utterance_id=item["id"],
-                    target_duration_seconds=item["slot_duration"] if needs_slowdown else target_span,
-                    min_atempo=min_atempo if fit_utterance_slots else 1.0,
+                    target_duration_seconds=act["target_dur"],
+                    min_atempo=effective_min_atempo if fit_utterance_slots else 1.0,
                     max_atempo=max_atempo,
+                    exact_atempo_ratio=ratio_to_apply if smooth_intra_speaker_rates else None,
                 )
                 if did_tempo:
                     prev_d = item["actual_duration"]
                     item["active_audio_file"] = str(adj_wav)
                     item["actual_duration"] = adj_dur
                     item["placement_end"] = item["placement_start"] + adj_dur
+                    item["applied_atempo"] = ratio
+                    item["resampling_count"] += 1
                     item["slot_overflow_seconds"] = round(max(0.0, adj_dur - item["slot_duration"]), 4)
                     duration_adjustments.append(
                         {
@@ -2088,7 +2241,7 @@ def analyze_timeline_collisions_and_overlaps(
                 needed_shift = running_end - new_start
                 max_allowed_start = min(
                     orig_start + max(0.0, float(max_timing_shift)),
-                    float(selection_end) - item["actual_duration"],
+                    clip_end_barrier - item["actual_duration"],
                 )
                 if orig_start + needed_shift <= max_allowed_start + 1e-4:
                     new_start = orig_start + needed_shift
@@ -2201,7 +2354,12 @@ def analyze_timeline_collisions_and_overlaps(
             "sync_anchor_used": item["sync_anchor_used"],
             "slot_duration_seconds": item["slot_duration"],
             "raw_tts_duration_seconds": item["raw_tts_duration"],
+            "trimmed_tts_duration_seconds": item["trimmed_tts_duration"],
             "actual_tts_duration_seconds": round(item["actual_duration"], 4),
+            "applied_atempo": round(float(item["applied_atempo"]), 4),
+            "resampling_count": int(item["resampling_count"]),
+            "trim_applied": bool(item["trim_applied"]),
+            "natural_trailing_pause_seconds": round(max(0.0, item["slot_duration"] - item["actual_duration"]), 4),
             "slot_overflow_seconds": item["slot_overflow_seconds"],
             "placement_start_seconds": round(item["placement_start"], 4),
             "placement_end_seconds": round(item["placement_end"], 4),
@@ -2211,9 +2369,11 @@ def analyze_timeline_collisions_and_overlaps(
                 4,
             ),
             "shift_seconds": round(item["placement_start"] - item["source_start"], 4),
+            "raw_audio_file": item["raw_audio_file"],
             "active_audio_file": item["active_audio_file"],
             "original_audio_file": item["original_audio_file"],
             "semantic_units": item.get("semantic_units", []),
+            "overlong_resolution_plan": item.get("overlong_resolution_plan"),
         }
         shifted_placements[item["id"]] = placement_info
         shifted_placements[item["raw_id"]] = placement_info
@@ -2248,9 +2408,12 @@ def analyze_timeline_collisions_and_overlaps(
         "clip_duration_seconds": round(float(selection_end) - float(selection_start), 4),
         "max_timing_shift_seconds": round(float(max_timing_shift), 4),
         "max_inter_speaker_shift_seconds": round(float(max_inter_speaker_shift), 4),
-        "min_atempo": round(float(min_atempo), 4),
+        "min_atempo": round(float(effective_min_atempo), 4),
         "max_atempo": round(float(max_atempo), 4),
+        "allow_slowdown": bool(slowdown_allowed),
         "fit_utterance_slots": bool(fit_utterance_slots),
+        "smooth_intra_speaker_rates": bool(smooth_intra_speaker_rates),
+        "intra_speaker_rate_smoothing": intra_speaker_rate_smoothing,
         "use_word_level_sync": bool(use_word_level_sync),
         "sync_anchor": sync_anchor,
         "initial_same_speaker_collisions": initial_same_speaker_collisions,
@@ -2288,6 +2451,18 @@ def _normalize_feedback_to_clip_relative(feedback_doc, *, selection_start, clip_
             if p_info.get("active_audio_file"):
                 entry["original_audio_file"] = entry.get("audio_file")
                 entry["audio_file"] = p_info["active_audio_file"]
+            for extra_k in (
+                "applied_atempo",
+                "resampling_count",
+                "trim_applied",
+                "natural_trailing_pause_seconds",
+                "raw_audio_file",
+                "raw_tts_duration_seconds",
+                "trimmed_tts_duration_seconds",
+                "overlong_resolution_plan",
+            ):
+                if extra_k in p_info:
+                    entry[extra_k] = p_info[extra_k]
         else:
             dur = float(
                 entry.get(
@@ -2320,16 +2495,21 @@ def run_technical_xvector_feedback(
     backend,
     voice_plan,
     reuse_wav_dir=None,
+    voice_registry=None,
+    max_consistency_retries=2,
 ):
     """Execute technical X-vector (or hybrid) TTS synthesis and WAV duration measurement directly.
 
     Decoupled from `voice_cloning.register_profile` so synthetic speakers and permitted audio
     sources do not require redundant `consent.json`/`review.json` registration ceremonies,
-    while never overwriting existing WAVs and never falling back to Preset on X-vector failure.
+    while enforcing SpeakerVoiceRegistry locking, never overwriting existing WAVs, and never
+    falling back to Preset on X-vector failure.
     """
     out_dir = Path(output_dir).resolve()
     audio_dir = out_dir / "audio"
+    raw_audio_dir = out_dir / "raw_audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
+    raw_audio_dir.mkdir(parents=True, exist_ok=True)
     voices = voice_plan["voices"]
     profiles = voice_plan.get("voice_profiles") or {}
     reuse_dir = Path(reuse_wav_dir).resolve() if reuse_wav_dir else None
@@ -2339,15 +2519,29 @@ def run_technical_xvector_feedback(
         uid = str(u["id"])
         safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", uid)
         spk = u["speaker"]
+        if spk not in voices:
+            raise XVectorSynthesisError(f"Speaker {spk!r} for utterance {uid!r} is missing from voice_plan['voices'].")
         voice_spec = voices[spk]
+        prof = profiles.get(spk)
+
+        locked_profile_meta = None
+        if voice_registry is not None:
+            locked_profile_meta = voice_registry.verify_utterance_routing(
+                u,
+                requested_voice=voice_spec,
+                requested_profile=prof,
+            )
+
         text_ja = str(u.get("text_ja") or "").strip()
         if not text_ja:
             raise XVectorSynthesisError(f"Utterance {uid!r} (speaker {spk!r}) has empty Japanese text (`text_ja`).")
 
         # Non-clobber output path inside `_work/tts_feedback/audio/`
         wav_out = audio_dir / f"{safe_id}.wav"
+        raw_wav_out = raw_audio_dir / f"{safe_id}_raw.wav"
         cache_reused = False
         backend_res = None
+        consistency_retry_count = 0
 
         # Check if a matching WAV exists in `--reuse-wav-dir` (read-only, never overwritten!)
         reused_src = None
@@ -2370,11 +2564,12 @@ def run_technical_xvector_feedback(
                 "sample_frames": len(samples),
                 "clone_method": voice_plan["effective_clone_method"] if voice_spec.startswith("approved_clone:") else "preset",
                 "x_vector_only_mode": voice_plan["effective_clone_method"] == "xvector",
+                "voice_profile_id": locked_profile_meta.voice_profile_id if locked_profile_meta else getattr(prof, "voice_profile_id", None),
+                "reference_audio_sha256": locked_profile_meta.reference_audio_sha256 if locked_profile_meta else getattr(prof, "reference_audio_sha256", None),
                 "reused_from": str(reused_src),
             }
         else:
             if voice_spec.startswith("approved_clone:"):
-                prof = profiles.get(spk)
                 if prof is None:
                     raise XVectorSynthesisError(
                         f"Missing voice reference/profile for speaker {spk!r} during X-vector synthesis."
@@ -2390,44 +2585,80 @@ def run_technical_xvector_feedback(
                         f"X-vector synthesis failed for utterance {uid!r} (speaker {spk!r}): {exc}. "
                         f"Automatic fallback to Preset is disabled."
                     ) from exc
+
+                # Phase 13.2: Check acoustic F0 consistency against locked speaker reference and retry with same locked profile if outlier
+                ref_f0 = None
+                if locked_profile_meta and isinstance(locked_profile_meta.speaker_embedding, dict):
+                    ref_f0 = locked_profile_meta.speaker_embedding.get("f0_median_hz")
+                if ref_f0 and ref_f0 > 0 and max_consistency_retries > 0 and wav_out.is_file():
+                    try:
+                        synth_sig = inspect.signature(backend.synthesize)
+                        supports_seed_override = (
+                            "seed_override" in synth_sig.parameters
+                            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in synth_sig.parameters.values())
+                        )
+                    except (TypeError, ValueError):
+                        supports_seed_override = False
+                    if supports_seed_override:
+                        base_seed = int(getattr(backend, "settings", {}).get("seed", 0))
+                        for retry_idx in range(1, int(max_consistency_retries) + 1):
+                            pr_check = analyze_japanese_prosody(wav_out, mora_count=u.get("mora_count"))
+                            cur_f0 = pr_check.get("f0_hz_median")
+                            if cur_f0 and cur_f0 > 0:
+                                st_diff = abs(12.0 * math.log2(cur_f0 / float(ref_f0)))
+                                if st_diff <= 6.5:
+                                    break
+                            consistency_retry_count = retry_idx
+                            backend_res = backend.synthesize(
+                                text=text_ja,
+                                profile=prof,
+                                output_path=wav_out,
+                                seed_override=base_seed + retry_idx * 17,
+                            )
             else:
-                from tts_generator import QwenPresetSynthesizer
-
-                if isinstance(backend, QwenPresetSynthesizer):
-                    from language.voice import VoiceProfile
-
-                    backend_res = backend.synthesize(
-                        text=text_ja,
-                        profile=VoiceProfile(
-                            speaker=spk,
-                            mode="preset",
-                            voice=voice_spec,
-                        ),
-                        output_path=wav_out,
-                    )
-                else:
-                    backend_res = backend.synthesize(
-                        text=text_ja,
-                        voice=voice_spec,
-                        output_path=wav_out,
-                    )
+                backend_res = backend.synthesize(
+                    text=text_ja,
+                    voice=voice_spec,
+                    output_path=wav_out,
+                )
 
         if not wav_out.is_file():
             raise XVectorSynthesisError(f"Synthesizer did not write output WAV for utterance {uid!r}: {wav_out}")
 
+        shutil.copyfile(wav_out, raw_wav_out)
         prosody = analyze_japanese_prosody(wav_out, mora_count=u.get("mora_count"))
         dur = float(prosody["audio_duration_seconds"])
         slot_dur = max(0.05, float(u["end"]) - float(u["start"]))
+        vp_id = (
+            locked_profile_meta.voice_profile_id
+            if locked_profile_meta is not None
+            else (
+                (backend_res or {}).get("voice_profile_id")
+                or getattr(prof, "voice_profile_id", None)
+                or f"vp-{spk}-{voice_spec}"
+            )
+        )
+        ref_sha = (
+            locked_profile_meta.reference_audio_sha256
+            if locked_profile_meta is not None
+            else (
+                (backend_res or {}).get("reference_audio_sha256")
+                or getattr(prof, "reference_audio_sha256", None)
+            )
+        )
 
         entry = {
             "id": u.get("raw_id", uid),
             "id_str": uid,
             "merged_from_ids": u.get("merged_from_ids"),
-            "source_utterance_ids": u.get("source_utterance_ids",u.get("merged_from_ids") or [u.get("raw_id",uid)]),
+            "source_utterance_ids": u.get("source_utterance_ids", u.get("merged_from_ids") or [u.get("raw_id", uid)]),
             "review_required": bool(u.get("review_required")),
-            "review_reasons": u.get("review_reasons",[]),
+            "review_reasons": u.get("review_reasons", []),
             "speaker": spk,
             "voice": voice_spec,
+            "voice_profile_id": vp_id,
+            "reference_audio_sha256": ref_sha,
+            "consistency_retry_count": consistency_retry_count,
             "text_en": u.get("text_en", ""),
             "text_ja": text_ja,
             "mora_count": int(u.get("mora_count") or _estimate_japanese_mora(text_ja)),
@@ -2440,6 +2671,7 @@ def run_technical_xvector_feedback(
             "actual_tts_duration_seconds": round(dur, 4),
             "slot_overflow_seconds": round(max(0.0, dur - slot_dur), 4),
             "generation_status": "complete",
+            "raw_audio_file": str(raw_wav_out),
             "audio_file": str(wav_out),
             "audio_sha256": prosody["sha256"],
             "cache_reused": cache_reused,
@@ -2461,16 +2693,163 @@ def run_technical_xvector_feedback(
     return fb_path, fb_doc
 
 
+def resolve_post_tts_clip_extension(
+    *,
+    feedback_entries,
+    placements_map,
+    selection_start,
+    selection_end,
+    requested_selection_end=None,
+    auto_extend_clip=False,
+    max_clip_extension_seconds=12.0,
+    source_video_duration=None,
+    target_sr=48000,
+):
+    """Inspect actual generated TTS WAV placements and auto-extend clip end when `--auto-extend-clip` is enabled."""
+    sel_start = float(selection_start)
+    sel_end = float(selection_end)
+    req_end = float(requested_selection_end) if requested_selection_end is not None else sel_end
+    base_frames = int(round(max(0.0, sel_end - sel_start) * int(target_sr)))
+
+    max_required_end = sel_end
+    max_required_frames = base_frames
+    overflowing_utterance_id = None
+
+    for entry in feedback_entries or []:
+        if entry.get("generation_status") not in (None, "complete"):
+            continue
+        uid = str(entry.get("id"))
+        p_info = placements_map.get(uid) or placements_map.get(entry.get("id"))
+        if p_info is None:
+            continue
+        rel_start = float(
+            p_info.get(
+                "clip_relative_start_seconds",
+                max(0.0, float(p_info.get("placement_start_seconds", sel_start)) - sel_start),
+            )
+        )
+        start_frame = int(round(rel_start * int(target_sr)))
+        placed_end = float(
+            p_info.get(
+                "placement_end_seconds",
+                sel_start + float(p_info.get("clip_relative_end_seconds", rel_start)),
+            )
+        )
+
+        wav_path_str = p_info.get("active_audio_file") or entry.get("audio_file")
+        end_frame = int(round(max(0.0, placed_end - sel_start) * int(target_sr)))
+        if wav_path_str and Path(wav_path_str).is_file():
+            samples, sr = _read_wav_float32(Path(wav_path_str))
+            if sr != int(target_sr) and len(samples) > 1:
+                wav_frames = max(1, int(round(len(samples) * float(target_sr) / float(sr))))
+            else:
+                wav_frames = len(samples)
+            end_frame = max(end_frame, start_frame + wav_frames)
+
+        utt_required_end = max(placed_end, sel_start + (end_frame / float(target_sr)))
+        if end_frame > max_required_frames or utt_required_end > max_required_end + 1e-6:
+            max_required_frames = max(max_required_frames, end_frame)
+            max_required_end = max(max_required_end, utt_required_end)
+            overflowing_utterance_id = uid
+
+    needs_extension = (max_required_frames > base_frames) or (max_required_end > sel_end + 1e-6)
+    if not needs_extension:
+        return {
+            "extension_applied": False,
+            "previous_selection_end": round(sel_end, 4),
+            "effective_selection_end": round(sel_end, 4),
+            "effective_clip_duration": round(sel_end - sel_start, 4),
+            "extended_seconds": 0.0,
+            "trigger_utterance_id": None,
+        }
+
+    min_dur = max(max_required_end - sel_start, max_required_frames / float(target_sr))
+    eff_clip_dur = math.ceil(min_dur * 10000.0 - 1e-9) / 10000.0
+    while int(round(eff_clip_dur * int(target_sr))) < max_required_frames:
+        eff_clip_dur = round(eff_clip_dur + 0.0001, 4)
+    eff_sel_end = round(sel_start + eff_clip_dur, 4)
+
+    if not auto_extend_clip:
+        raise ValueError(f"Full WAV for utterance {overflowing_utterance_id} exceeds the selected clip; truncation refused.")
+
+    if source_video_duration is not None and float(source_video_duration) > 0.0:
+        src_max_end = float(source_video_duration)
+        if eff_sel_end > src_max_end + 1e-4:
+            raise ValueError(
+                f"Cannot auto-extend clip end to {eff_sel_end:.2f}s for utterance {overflowing_utterance_id}: "
+                f"exceeds source video duration ({src_max_end:.2f}s); truncation refused."
+            )
+
+    if max_clip_extension_seconds is not None:
+        total_ext = eff_sel_end - min(req_end, sel_end)
+        if total_ext > float(max_clip_extension_seconds) + 1e-4:
+            raise ValueError(
+                f"Cannot auto-extend clip end to {eff_sel_end:.2f}s for utterance {overflowing_utterance_id}: "
+                f"required extension ({total_ext:.2f}s) exceeds max_clip_extension_seconds "
+                f"({float(max_clip_extension_seconds):.2f}s); truncation refused."
+            )
+
+    return {
+        "extension_applied": True,
+        "previous_selection_end": round(sel_end, 4),
+        "effective_selection_end": eff_sel_end,
+        "effective_clip_duration": round(eff_clip_dur, 4),
+        "extended_seconds": round(eff_sel_end - sel_end, 4),
+        "trigger_utterance_id": overflowing_utterance_id,
+    }
+
+
 def _prepare_clip_video_source(video_path, *, selection_start, clip_duration, work_dir, ffmpeg_bin=None):
     """Ensure the video file matches the `[selection_start, selection_start + clip_duration]` window without modifying `video_path`."""
     src = Path(video_path).resolve()
     probe = probe_media_streams(src)
     dur = float(probe.get("duration_seconds") or 0.0)
+    target_dur = float(clip_duration)
+
+    if 0.0 < dur < target_dur - 1e-3 and (float(selection_start) <= 0.0 or dur < float(selection_start)):
+        pad_sec = max(0.001, target_dur - dur)
+        ext_tag = f"{int(round(float(selection_start) * 100))}_{int(round(target_dur * 10000))}"
+        ext_mp4 = Path(work_dir).resolve() / f"source_extended_{ext_tag}.mp4"
+        if ext_mp4.is_file():
+            return ext_mp4, probe_media_streams(ext_mp4)
+        tmp_ext = ext_mp4.with_suffix(".tmp.mp4")
+        cmd_ext = [
+            ffmpeg_bin or _resolve_binary("ffmpeg"),
+            "-y",
+            "-i",
+            str(src),
+            "-vf",
+            f"tpad=stop_mode=clone:stop_duration={pad_sec:.4f}",
+            "-af",
+            f"apad=pad_dur={pad_sec:.4f}",
+            "-t",
+            f"{target_dur:.4f}",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            str(tmp_ext),
+        ]
+        proc_ext = subprocess.run(cmd_ext, capture_output=True, text=True, check=False)
+        if proc_ext.returncode == 0 and tmp_ext.is_file():
+            tmp_ext.replace(ext_mp4)
+            return ext_mp4, probe_media_streams(ext_mp4)
+        return src, probe
+
     if dur <= float(clip_duration) + 2.0 or float(selection_start) <= 0.0:
         return src, probe
 
-    # Source video is a longer recording; extract the target 30s segment non-destructively into work_dir
-    seg_mp4 = Path(work_dir).resolve() / f"source_segment_{int(selection_start)}_{int(selection_start + clip_duration)}.mp4"
+    # Source video is a longer recording; extract the target segment non-destructively into work_dir
+    seg_tag = f"{int(round(float(selection_start) * 100))}_{int(round((float(selection_start) + target_dur) * 100))}"
+    seg_mp4 = Path(work_dir).resolve() / f"source_segment_{seg_tag}.mp4"
     if seg_mp4.is_file():
         return seg_mp4, probe_media_streams(seg_mp4)
 
@@ -2969,26 +3348,13 @@ def _format_ass_time(seconds):
 
 
 def _wrap_japanese_lines(text, max_line_chars=22):
-    clean = str(text).strip()
+    from japanese_subtitles import _balance_group_into_two_lines, segment_japanese_bunsetsu
+
+    clean = str(text or "").strip()
     if len(clean) <= max_line_chars:
         return [clean]
-    mid = len(clean) // 2
-    best_split = None
-    for offset in range(0, len(clean) // 2):
-        for pos in (mid + offset, mid - offset):
-            if 2 <= pos < len(clean) - 2:
-                prev_ch = clean[pos - 1]
-                next_ch = clean[pos]
-                if prev_ch.isascii() and prev_ch.isalnum() and next_ch.isascii() and next_ch.isalnum():
-                    continue
-                if prev_ch in "、。！？はがをにでとへもやの":
-                    best_split = pos
-                    break
-        if best_split is not None:
-            break
-    if best_split is None:
-        best_split = mid
-    return [clean[:best_split].strip(), clean[best_split:].strip()]
+    tokens = segment_japanese_bunsetsu(clean)
+    return _balance_group_into_two_lines(tokens, max_chars_per_line=max_line_chars)
 
 
 def _fallback_generate_subtitles_and_mp4(
@@ -3093,7 +3459,6 @@ def _fallback_generate_subtitles_and_mp4(
             end_s = min(float(clip_duration), start_s + 0.5)
         spk = e.get("speaker", DEFAULT_SPEAKER_ID)
         raw_lines = list(e.get("lines") or _wrap_japanese_lines(e["text_ja"], max_line_chars=style.max_chars_per_line))
-        raw_lines = prevent_line_overflow(raw_lines, style)
         disp_lines = list(
             e.get("display_lines")
             or format_subtitle_display_lines(raw_lines, strip_periods=style.strip_periods, comma_mode=style.comma_mode)
@@ -3451,6 +3816,10 @@ def run_phase11_dubbing_pipeline(
     min_atempo=0.90,
     max_atempo=1.25,
     fit_utterance_slots=False,
+    allow_slowdown=None,
+    smooth_intra_speaker_rates=False,
+    enforce_voice_registry=True,
+    emit_phase13_2_reports=False,
     mix_mode="voiceover",
     duck_gain=0.12,
     unspoken_gain=1.0,
@@ -3485,8 +3854,9 @@ def run_phase11_dubbing_pipeline(
     video_fade_out_seconds=0.0,
     auto_rebalance_overlong=False,
     utterance_translations_path=None,
+    source_video_duration=None,
 ):
-    """Execute the end-to-end Japanese dubbing pipeline (supporting Phase 11, Phase 12, Phase 13, and Phase 13.1 workflows)."""
+    """Execute the end-to-end Japanese dubbing pipeline (supporting Phase 11, Phase 12, Phase 13, Phase 13.1, and Phase 13.2 workflows)."""
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     if any(root.iterdir()):
@@ -3674,15 +4044,34 @@ def run_phase11_dubbing_pipeline(
 
     # Phase 13.1: Detect clip boundary mid-utterance / mid-sentence cuts and optionally auto-extend clip
     from timing_adjustment import (
+        build_timing_quality_report,
         concise_rewrite_for_timing_budget,
         detect_and_resolve_clip_boundaries,
         extract_or_resolve_word_timestamps,
     )
+    from voice_consistency import (
+        SpeakerVoiceRegistry,
+        build_speaker_assignment_report,
+        concatenate_speaker_voice_samples,
+        evaluate_speaker_voice_consistency,
+    )
 
+    initial_requested_selection_end = selection_end
     raw_video_probe_initial = probe_media_streams(raw_video_file) if raw_video_file.is_file() else {}
     raw_video_dur = float(raw_video_probe_initial.get("duration_seconds") or 0.0)
-    # If raw_video_file is the full source video (longer than selection_end), pass its duration; else pass None for proposal
-    avail_source_dur = raw_video_dur if raw_video_dur >= selection_end else None
+    explicit_src_dur = source_video_duration
+    if explicit_src_dur is None and isinstance(raw_script_doc, dict):
+        explicit_src_dur = raw_script_doc.get("source_video_duration") or (
+            raw_script_doc.get("selection_range", {}).get("source_video_duration")
+            if isinstance(raw_script_doc.get("selection_range"), dict)
+            else None
+        )
+    if explicit_src_dur is not None:
+        avail_source_dur = float(explicit_src_dur)
+    elif raw_video_dur > 0.0 and (selection_start <= 0.0 or raw_video_dur >= selection_end):
+        avail_source_dur = raw_video_dur
+    else:
+        avail_source_dur = None
 
     clip_boundary_resolution = detect_and_resolve_clip_boundaries(
         source_rows if source_rows is not None else norm_script["utterances"],
@@ -3696,7 +4085,6 @@ def run_phase11_dubbing_pipeline(
         selection_start = clip_boundary_resolution["effective_selection"]["start"]
         selection_end = clip_boundary_resolution["effective_selection"]["end"]
         clip_duration = clip_boundary_resolution["effective_selection"]["duration"]
-        # If source_rows has utterances that now fall within the extended [selection_start, selection_end], include them!
         if source_rows is not None:
             existing_src_ids = {
                 str(sid)
@@ -3765,7 +4153,6 @@ def run_phase11_dubbing_pipeline(
     merge_inputs = [assigned_by_id.get(r["id"], r) for r in norm_script["utterances"]]
 
     # 3. Step 3a: Detect & merge split continuous utterances
-    # Note: `speaker: null` / UNKNOWN utterances are preserved as barriers and never merged!
     already_revised = bool(isinstance(raw_script_doc, dict) and raw_script_doc.get("quality_revision"))
     merge_result = detect_and_merge_split_utterances(
         merge_inputs,
@@ -3916,6 +4303,39 @@ def run_phase11_dubbing_pipeline(
         effective_top_p = float(prosody_tuning_info["top_p"])
         effective_rep_pen = float(prosody_tuning_info["repetition_penalty"])
 
+    # Phase 13.2: Initialize & lock SpeakerVoiceRegistry for all active speakers
+    voice_registry = SpeakerVoiceRegistry()
+    all_refs = {**voice_profiles, **technical_references}
+    gen_settings_for_registry = {
+        "seed": int(seed),
+        "temperature": effective_temp,
+        "top_k": effective_top_k,
+        "top_p": effective_top_p,
+        "repetition_penalty": effective_rep_pen,
+    }
+    for r_item in voice_plan.get("speaker_routing_details", []):
+        spk_id = r_item["speaker"]
+        s_mode = r_item["mode"]
+        ref_obj = all_refs.get(spk_id)
+        ref_wav_p = getattr(ref_obj, "reference_audio", None) if ref_obj is not None else None
+        voice_registry.register_speaker_profile(
+            speaker_id=spk_id,
+            voice_mode=s_mode,
+            reference_audio_path=ref_wav_p if s_mode == "approved_clone" else None,
+            clone_method=r_item.get("clone_method") or voice_plan.get("effective_clone_method", "xvector"),
+            preset_voice=r_item.get("voice") if s_mode == "preset" else getattr(ref_obj, "preset_voice", None),
+            model_id=clone_model if s_mode == "approved_clone" else preset_model,
+            model_revision="locked",
+            generation_settings=gen_settings_for_registry,
+            verification_status=r_item.get("authorization_status", "verified"),
+            reference_origin=r_item.get("reference_origin"),
+            profile_fingerprint=r_item.get("profile_fingerprint"),
+        )
+    registry_json_path = work_dir / "speaker_voice_registry.json"
+    voice_registry.save(registry_json_path)
+    if emit_phase13_2_reports:
+        voice_registry.save(root / "speaker_voice_registry.json")
+
     # 7. Run X-vector TTS synthesis & feedback measurement
     tts_dir = work_dir / "tts_feedback"
     did_modify_script = bool(
@@ -3985,6 +4405,7 @@ def run_phase11_dubbing_pipeline(
                 backend=active_backend,
                 voice_plan=voice_plan,
                 reuse_wav_dir=reuse_wav_dir,
+                voice_registry=voice_registry if enforce_voice_registry else None,
             )
         else:
             from tts_feedback import run_feedback
@@ -4007,11 +4428,11 @@ def run_phase11_dubbing_pipeline(
                     backend=active_backend,
                     voice_plan=voice_plan,
                     reuse_wav_dir=reuse_wav_dir,
+                    voice_registry=voice_registry if enforce_voice_registry else None,
                 )
 
     # 8. Measure actual Japanese audio durations and adjust overflows / collisions / inter-speaker overlaps
     adjusted_wav_dir = work_dir / "adjusted_wavs"
-    # Attach words / source_segment_spans from active_utterances onto feedback entries so word-level sync has full word timing
     active_by_id = {str(u["id"]): u for u in active_utterances}
     for fb_e in feedback_doc.get("entries", []):
         u_orig = active_by_id.get(str(fb_e.get("id")))
@@ -4030,13 +4451,50 @@ def run_phase11_dubbing_pipeline(
         min_atempo=min_atempo,
         max_atempo=max_atempo,
         fit_utterance_slots=fit_utterance_slots,
+        allow_slowdown=allow_slowdown,
+        smooth_intra_speaker_rates=smooth_intra_speaker_rates,
         adjusted_wav_dir=adjusted_wav_dir,
         source_utterances=source_rows or norm_script["utterances"],
         word_timestamps=external_words,
         use_word_level_sync=use_word_level_sync,
         sync_anchor=sync_anchor,
         long_pause_threshold=long_pause_threshold,
+        auto_extend_clip=bool(auto_extend_clip),
+        max_clip_extension_seconds=max_clip_extension_seconds,
+        source_video_duration=avail_source_dur,
     )
+    post_tts_extension = resolve_post_tts_clip_extension(
+        feedback_entries=feedback_doc.get("entries", []),
+        placements_map=timeline_analysis["placements"],
+        selection_start=selection_start,
+        selection_end=selection_end,
+        requested_selection_end=initial_requested_selection_end,
+        auto_extend_clip=bool(auto_extend_clip),
+        max_clip_extension_seconds=max_clip_extension_seconds,
+        source_video_duration=avail_source_dur,
+    )
+    if post_tts_extension["extension_applied"]:
+        selection_end = post_tts_extension["effective_selection_end"]
+        clip_duration = post_tts_extension["effective_clip_duration"]
+        clip_boundary_resolution["extension_applied"] = True
+        clip_boundary_resolution["clip_was_extended"] = True
+        clip_boundary_resolution["effective_clip_end"] = selection_end
+        clip_boundary_resolution["effective_clip_duration"] = clip_duration
+        clip_boundary_resolution["effective_selection"] = {
+            "start": selection_start,
+            "end": selection_end,
+            "duration": clip_duration,
+        }
+        clip_boundary_resolution["post_tts_extension"] = post_tts_extension
+        working_script_doc["selection_range"] = {"start": selection_start, "end": selection_end}
+        _atomic_write_json(working_script_path, working_script_doc)
+        did_modify_script = True
+        video_file, source_video_probe = _prepare_clip_video_source(
+            raw_video_file,
+            selection_start=selection_start,
+            clip_duration=clip_duration,
+            work_dir=work_dir,
+        )
     unresolved = timeline_analysis["unresolved_same_speaker_collisions"]
     if unresolved and not allow_diagnostic_on_collision:
         raise RuntimeError(
@@ -4170,11 +4628,49 @@ def run_phase11_dubbing_pipeline(
     integrity_verification = _verify_input_files_unchanged(input_snapshot_before)
 
     from voice_quality import evaluate_dubbing_voice_and_naturalness
-    all_refs = {**voice_profiles, **technical_references}
     voice_evaluation = evaluate_dubbing_voice_and_naturalness(
         rel_feedback_doc.get("entries", []),
         speaker_references=all_refs,
     )
+
+    # Phase 13.2: Evaluate intra-speaker voice consistency, speaker assignment integrity, and timing quality
+    voice_consistency_report = evaluate_speaker_voice_consistency(
+        rel_feedback_doc.get("entries", []),
+        registry=voice_registry,
+    )
+    speaker_assignment_report = build_speaker_assignment_report(
+        utterances_after_merge,
+        voice_registry=voice_registry,
+        feedback_entries=rel_feedback_doc.get("entries", []),
+        speaker_verification_targets=speaker_verification_targets,
+    )
+    timing_quality_report = build_timing_quality_report(
+        rel_feedback_doc.get("entries", []),
+        placements_map=timeline_analysis["placements"],
+        duration_adjustments=timeline_analysis.get("duration_adjustments", []),
+        allow_slowdown=bool((float(min_atempo) < 1.0) if allow_slowdown is None else allow_slowdown),
+        max_atempo=float(max_atempo),
+    )
+
+    voice_consistency_json = (root if emit_phase13_2_reports else work_dir) / "voice_consistency_report.json"
+    speaker_assignment_json = (root if emit_phase13_2_reports else work_dir) / "speaker_assignment_report.json"
+    timing_quality_json = (root if emit_phase13_2_reports else work_dir) / "timing_quality_report.json"
+    _atomic_write_json(voice_consistency_json, voice_consistency_report)
+    _atomic_write_json(speaker_assignment_json, speaker_assignment_report)
+    _atomic_write_json(timing_quality_json, timing_quality_report)
+
+    speaker_sample_wavs = {}
+    if emit_phase13_2_reports:
+        for spk_k in sorted(voice_registry.profiles.keys()):
+            safe_spk = spk_k.lower()
+            sample_out = root / f"{safe_spk}_voice_samples.wav"
+            sample_res = concatenate_speaker_voice_samples(
+                rel_feedback_doc.get("entries", []),
+                speaker_id=spk_k,
+                output_wav_path=sample_out,
+            )
+            if sample_res.get("utterance_count", 0) > 0:
+                speaker_sample_wavs[spk_k] = str(sample_out)
 
     from dubbing_quality import completion_assessment, detect_quality_anomalies
     completion = completion_assessment(
@@ -4233,6 +4729,10 @@ def run_phase11_dubbing_pipeline(
             "loudness_and_clipping": mix_report.get("loudness_verification"),
         },
         "voice_routing": {k: v for k, v in voice_plan.items() if k != "voice_profiles"},
+        "speaker_voice_registry": voice_registry.to_dict(),
+        "voice_consistency_report": voice_consistency_report,
+        "speaker_assignment_report": speaker_assignment_report,
+        "timing_quality_report": timing_quality_report,
         "prosody_tuning": prosody_tuning_info,
         "voice_and_naturalness_evaluation": voice_evaluation,
         "rights_and_governance": voice_plan.get("rights_and_governance", []),
@@ -4257,6 +4757,7 @@ def run_phase11_dubbing_pipeline(
             "style": sub_report.get("style"),
             "cue_count": sub_report.get("cue_count"),
             "overflow_check": sub_report.get("overflow_check"),
+            "unnatural_break_check": sub_report.get("unnatural_break_check"),
             "subtitle_render_mode": sub_report.get("subtitle_render_mode"),
         },
         "input_integrity_verification": integrity_verification,
@@ -4270,6 +4771,11 @@ def run_phase11_dubbing_pipeline(
             "clip_relative_feedback_json": str(rel_feedback_path),
             "mix_report_json": str(mix_report_path),
             "subtitle_report_json": str(sub_report_path),
+            "speaker_voice_registry_json": str(root / "speaker_voice_registry.json") if emit_phase13_2_reports else str(registry_json_path),
+            "voice_consistency_report_json": str(voice_consistency_json),
+            "speaker_assignment_report_json": str(speaker_assignment_json),
+            "timing_quality_report_json": str(timing_quality_json),
+            "speaker_voice_sample_wavs": speaker_sample_wavs,
             "speaker_verification_targets_json": str(verification_targets_path) if speaker_verification_targets else None,
         },
         "media_verification": {
@@ -4373,13 +4879,7 @@ def run_phase13_1_dubbing_pipeline(
     output_dir,
     **kwargs,
 ):
-    """Execute Phase 13.1 Universal Japanese Dubbing Pipeline with:
-    - Word-level timestamp synchronization (preventing premature TTS starts on fillers/pauses, adaptive/end back-calculation)
-    - Continuous 18% original audio ducking (preventing 100% volume jumps when TTS finishes)
-    - Automatic clip boundary mid-sentence detection & extension + smooth boundary fade-out
-    - 0.90..1.30x rate adjustment + concise translation rebalancing
-    - High-visibility subtitles with semi-transparent background box (座布団)
-    """
+    """Execute Phase 13.1 Universal Japanese Dubbing Pipeline."""
     defaults = {
         "voice_mode": "xvector",
         "clone_method": "xvector",
@@ -4396,6 +4896,68 @@ def run_phase13_1_dubbing_pipeline(
         "fit_utterance_slots": True,
         "use_word_level_sync": True,
         "sync_anchor": "adaptive",
+        "long_pause_threshold": 0.55,
+        "mix_mode": "continuous-voiceover",
+        "ducking_style": "continuous",
+        "duck_gain": 0.18,
+        "unspoken_gain": 0.18,
+        "auto_extend_clip": True,
+        "max_clip_extension_seconds": 12.0,
+        "boundary_fade_out_seconds": 0.40,
+        "auto_rebalance_overlong": True,
+        "subtitle_font_scale": 1.25,
+        "subtitle_background_box": True,
+        "subtitle_strip_periods": True,
+        "subtitle_comma_mode": "halfwidth_space",
+        "allow_diagnostic_on_collision": True,
+    }
+    defaults.update(kwargs)
+    return run_phase11_dubbing_pipeline(
+        script_path=script_path,
+        video_path=video_path,
+        output_dir=output_dir,
+        **defaults,
+    )
+
+
+def run_phase13_2_dubbing_pipeline(
+    *,
+    video_path,
+    script_path,
+    output_dir,
+    **kwargs,
+):
+    """Execute Phase 13.2 Universal Japanese Dubbing Pipeline with:
+    - Locked SpeakerVoiceRegistry & intra-speaker voice consistency evaluation + retry
+    - Natural speaking rate (1.00x default, <= 1.20x speedup, automatic slowdown prohibited, intra-speaker smoothing)
+    - Speaker Diarization & TTS Voice Assignment integrity tracking
+    - BudouX-style bunsetsu subtitle line-breaking & strict max 2 lines (<= 22 chars/line)
+    - Continuous 18% original audio ducking & word-level start synchronization
+    """
+    defaults = {
+        "voice_mode": "xvector",
+        "clone_method": "xvector",
+        "allow_preset_fallback": False,
+        "extract_reference_from_video": True,
+        "rights_mode": "permitted_local",
+        "merge_split_utterances": True,
+        "null_speaker_policy": "hold_for_verification",
+        "temperature": 0.65,
+        "top_k": 25,
+        "top_p": 0.88,
+        "repetition_penalty": 1.03,
+        "max_timing_shift": 1.2,
+        "max_inter_speaker_shift": 0.6,
+        "auto_tempo_adjust": True,
+        "min_atempo": 1.00,
+        "max_atempo": 1.20,
+        "fit_utterance_slots": True,
+        "allow_slowdown": False,
+        "smooth_intra_speaker_rates": True,
+        "enforce_voice_registry": True,
+        "emit_phase13_2_reports": True,
+        "use_word_level_sync": True,
+        "sync_anchor": "content_start",
         "long_pause_threshold": 0.55,
         "mix_mode": "continuous-voiceover",
         "ducking_style": "continuous",
@@ -4535,8 +5097,8 @@ def _format_pipeline_report_md(report):
     return "\n".join(lines)
 
 
-def _add_common_cli_arguments(p, *, is_phase12=False, is_phase13=False, is_phase13_1=False):
-    is_modern = bool(is_phase12 or is_phase13 or is_phase13_1)
+def _add_common_cli_arguments(p, *, is_phase12=False, is_phase13=False, is_phase13_1=False, is_phase13_2=False):
+    is_modern = bool(is_phase12 or is_phase13 or is_phase13_1 or is_phase13_2)
     p.add_argument("--source-utterances", "--source-transcript-json", dest="source_utterances", type=Path, help="Full source utterances for coverage and boundary checks")
     p.add_argument("--word-timestamps", "--word-timestamps-json", dest="word_timestamps", type=Path, default=None, help="Path to English word_timestamps.json for word-level speech sync")
     p.add_argument("--utterance-translations", dest="utterance_translations", type=Path, default=None, help="Optional path to utterance_translations.json")
@@ -4693,10 +5255,10 @@ def _add_common_cli_arguments(p, *, is_phase12=False, is_phase13=False, is_phase
     p.add_argument("--preset-model", default=DEFAULT_PRESET_MODEL)
     p.add_argument("--clone-model", default=DEFAULT_BASE_MODEL)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--temperature", type=float, default=0.9)
-    p.add_argument("--top-k", type=int, default=50)
-    p.add_argument("--top-p", type=float, default=1.0)
-    p.add_argument("--repetition-penalty", type=float, default=1.05)
+    p.add_argument("--temperature", type=float, default=0.65 if is_phase13_2 else 0.9)
+    p.add_argument("--top-k", type=int, default=25 if is_phase13_2 else 50)
+    p.add_argument("--top-p", type=float, default=0.88 if is_phase13_2 else 1.0)
+    p.add_argument("--repetition-penalty", type=float, default=1.03 if is_phase13_2 else 1.05)
     p.add_argument("--max-timing-shift", type=float, default=1.2 if is_modern else 0.5)
     p.add_argument("--max-inter-speaker-shift", type=float, default=0.6 if is_modern else 0.0)
     p.add_argument(
@@ -4704,7 +5266,7 @@ def _add_common_cli_arguments(p, *, is_phase12=False, is_phase13=False, is_phase
         dest="auto_tempo_adjust",
         action="store_true",
         default=True if is_modern else False,
-        help="Trim silence and apply bounded non-destructive atempo (0.9..1.3x) to synchronize speech timing",
+        help="Trim silence and apply bounded non-destructive atempo to synchronize speech timing",
     )
     p.add_argument(
         "--no-auto-tempo-adjust",
@@ -4712,13 +5274,39 @@ def _add_common_cli_arguments(p, *, is_phase12=False, is_phase13=False, is_phase
         action="store_false",
         help="Disable automatic non-destructive tempo adjustment",
     )
-    p.add_argument("--min-atempo", type=float, default=0.90, help="Min bounded atempo ratio for slot fitting (default: 0.90)")
-    p.add_argument("--max-atempo", type=float, default=1.30 if (is_phase13 or is_phase13_1) else 1.25, help="Max bounded atempo ratio (default: 1.30)")
+    p.add_argument("--min-atempo", type=float, default=1.00 if is_phase13_2 else 0.90, help="Min bounded atempo ratio (default: 1.00 in Phase 13.2, 0.90 in Phase 13)")
+    p.add_argument("--max-atempo", type=float, default=1.20 if is_phase13_2 else (1.30 if (is_phase13 or is_phase13_1) else 1.25), help="Max bounded atempo ratio (default: 1.20 in Phase 13.2)")
+    p.add_argument(
+        "--allow-slowdown",
+        dest="allow_slowdown",
+        action="store_true",
+        default=False if is_phase13_2 else None,
+        help="Explicitly allow bounded slowdown (atempo >= 0.95) when TTS is shorter than slot",
+    )
+    p.add_argument(
+        "--no-allow-slowdown",
+        dest="allow_slowdown",
+        action="store_false",
+        help="Prohibit automatic slowdown (default in Phase 13.2); short TTS plays at 1.00x and leaves a natural pause",
+    )
+    p.add_argument(
+        "--smooth-intra-speaker-rates",
+        dest="smooth_intra_speaker_rates",
+        action="store_true",
+        default=True if is_phase13_2 else False,
+        help="Smooth speaking rate ratios across adjacent same-speaker utterances",
+    )
+    p.add_argument(
+        "--no-smooth-intra-speaker-rates",
+        dest="smooth_intra_speaker_rates",
+        action="store_false",
+        help="Disable intra-speaker speaking rate smoothing",
+    )
     p.add_argument(
         "--fit-utterance-slots",
         dest="fit_utterance_slots",
         action="store_true",
-        default=True if (is_phase13 or is_phase13_1) else False,
+        default=True if (is_phase13 or is_phase13_1 or is_phase13_2) else False,
         help="Automatically adjust TTS speaking rate within [min_atempo, max_atempo] to match speaker utterance slots",
     )
     p.add_argument(
@@ -5476,29 +6064,65 @@ def run_phase13_1_new_video_e2e(
     spk01_ref = ref_dir / "SPEAKER_01.wav"
     spk00_ref = ref_dir / "SPEAKER_00.wav"
     fallback_spk01 = Path(reference_fallback_dir) / "SPEAKER_01_extracted_ref.wav" if reference_fallback_dir else None
-    if fallback_spk01 and fallback_spk01.exists() and fallback_spk01.stat().st_size > 1000:
-        shutil.copy2(fallback_spk01, spk01_ref)
-    else:
-        _synthesize_mora_conditioned_speech_wav(
-            spk01_ref,
-            "ここ1、2年で、ほとんど動かなかったものが、博士課程レベルの数学を解くまでになった。",
-            target_duration_seconds=5.5,
-            f0_hz=114.0,
-            harmonic_ratios=[1.0, 0.68, 0.44, 0.28, 0.16, 0.09],
-            spectral_centroid_hz=590.0,
-            seed=101,
-        )
+    fallback_spk00 = Path(reference_fallback_dir) / "SPEAKER_00_extracted_ref.wav" if reference_fallback_dir else None
 
-    # Extract or synthesize SPEAKER_00 reference (distinct higher-pitched conversational voice)
-    _synthesize_mora_conditioned_speech_wav(
-        spk00_ref,
-        "でも物理的な作業や工場の組み立てはどうですか。人が実演してロボットが学ぶ形ではだめですか。",
-        target_duration_seconds=5.2,
-        f0_hz=152.0,
-        harmonic_ratios=[1.0, 0.82, 0.58, 0.39, 0.24, 0.14],
-        spectral_centroid_hz=820.0,
-        seed=202,
-    )
+    if cut_from_real_source and source_mp4_out.is_file():
+        # Extract real solo speech segments for both SPEAKER_01 and SPEAKER_00 directly from source.mp4!
+        try:
+            tref_01 = extract_speaker_reference_from_video(
+                video_path=source_mp4_out,
+                speaker_id="SPEAKER_01",
+                all_utterances=script_utterances,
+                output_dir=ref_dir,
+                selection_start=eff_start,
+                clip_duration=eff_duration,
+            )
+            shutil.copy2(tref_01.reference_audio, spk01_ref)
+        except Exception:
+            if fallback_spk01 and fallback_spk01.exists() and fallback_spk01.stat().st_size > 1000:
+                shutil.copy2(fallback_spk01, spk01_ref)
+        try:
+            tref_00 = extract_speaker_reference_from_video(
+                video_path=source_mp4_out,
+                speaker_id="SPEAKER_00",
+                all_utterances=script_utterances,
+                output_dir=ref_dir,
+                selection_start=eff_start,
+                clip_duration=eff_duration,
+            )
+            shutil.copy2(tref_00.reference_audio, spk00_ref)
+        except Exception:
+            if fallback_spk00 and fallback_spk00.exists() and fallback_spk00.stat().st_size > 1000:
+                shutil.copy2(fallback_spk00, spk00_ref)
+
+    if not spk01_ref.is_file() or spk01_ref.stat().st_size <= 1000:
+        if fallback_spk01 and fallback_spk01.exists() and fallback_spk01.stat().st_size > 1000:
+            shutil.copy2(fallback_spk01, spk01_ref)
+        else:
+            _synthesize_mora_conditioned_speech_wav(
+                spk01_ref,
+                "ここ1、2年で、ほとんど動かなかったものが、博士課程レベルの数学を解くまでになった。",
+                target_duration_seconds=5.5,
+                f0_hz=114.0,
+                harmonic_ratios=[1.0, 0.68, 0.44, 0.28, 0.16, 0.09],
+                spectral_centroid_hz=590.0,
+                seed=101,
+            )
+
+    if not spk00_ref.is_file() or spk00_ref.stat().st_size <= 1000:
+        if fallback_spk00 and fallback_spk00.exists() and fallback_spk00.stat().st_size > 1000:
+            shutil.copy2(fallback_spk00, spk00_ref)
+        else:
+            # Synthesize SPEAKER_00 reference with natural feminine interviewer timbre (F0=205Hz, centroid=1020Hz)
+            _synthesize_mora_conditioned_speech_wav(
+                spk00_ref,
+                "でも肉体労働や組み立て作業では人型ロボットの能力も必要になりますが、まだそこまでは至っていませんよね。",
+                target_duration_seconds=5.2,
+                f0_hz=205.0,
+                harmonic_ratios=[1.0, 0.86, 0.64, 0.44, 0.28, 0.16],
+                spectral_centroid_hz=1020.0,
+                seed=202,
+            )
 
     # Copy primary reference.wav to out_dir / "reference.wav" as requested
     reference_wav_out = out_dir / "reference.wav"
@@ -5534,8 +6158,9 @@ def run_phase13_1_new_video_e2e(
     if not live_qwen3_available:
         for idx, u in enumerate(script_utterances, start=1):
             spk = u["speaker"]
-            slot_dur = max(0.9, float(u["clip_relative_end"]) - float(u["clip_relative_effective_content_start"]))
-            target_wav_dur = max(0.85, min(slot_dur * 0.92, len(u["translated_text"]) * 0.145))
+            mora_cnt = max(4, _estimate_japanese_mora(u["translated_text"]))
+            # Natural Japanese conversational speaking rate (~8.5 mora/sec) without pre-stretching to slot_dur!
+            target_wav_dur = max(0.88, round(mora_cnt * 0.112 + 0.12, 3))
             if spk == "SPEAKER_01":
                 clone_f0 = float(spk01_profile["f0_mean_hz"])
                 clone_harm = spk01_profile["harmonic_ratios"]
@@ -5543,13 +6168,15 @@ def run_phase13_1_new_video_e2e(
                 preset_f0 = 136.0
                 preset_harm = [1.0, 0.48, 0.25, 0.12, 0.06, 0.03]
                 preset_cent = 760.0
+                spk_seed = 101
             else:
                 clone_f0 = float(spk00_profile["f0_mean_hz"])
                 clone_harm = spk00_profile["harmonic_ratios"]
                 clone_cent = float(spk00_profile["spectral_centroid_hz"])
-                preset_f0 = 168.0
-                preset_harm = [1.0, 0.45, 0.22, 0.11, 0.05, 0.02]
-                preset_cent = 910.0
+                preset_f0 = 212.0
+                preset_harm = [1.0, 0.55, 0.32, 0.18, 0.09, 0.04]
+                preset_cent = 1060.0
+                spk_seed = 202
 
             _synthesize_mora_conditioned_speech_wav(
                 clone_wav_dir / f"dub-{idx:03d}.wav",
@@ -5558,7 +6185,7 @@ def run_phase13_1_new_video_e2e(
                 f0_hz=clone_f0,
                 harmonic_ratios=clone_harm,
                 spectral_centroid_hz=clone_cent,
-                seed=1000 + idx,
+                seed=spk_seed,
             )
             _synthesize_mora_conditioned_speech_wav(
                 preset_wav_dir / f"dub-{idx:03d}.wav",
@@ -5567,12 +6194,12 @@ def run_phase13_1_new_video_e2e(
                 f0_hz=preset_f0,
                 harmonic_ratios=preset_harm,
                 spectral_centroid_hz=preset_cent,
-                seed=2000 + idx,
+                seed=spk_seed + 500,
             )
 
-    # Run Clone Pipeline (produces final_ja_clone.mp4 and main pipeline_report.json)
+    # Run Clone Pipeline with Phase 13.2 improvements (locked SpeakerVoiceRegistry, no slowdown, <=1.20x speedup, BudouX 2-line subtitles)
     clone_out_dir = out_dir / "clone_run"
-    clone_report_path, clone_report = run_phase13_1_dubbing_pipeline(
+    clone_report_path, clone_report = run_phase13_2_dubbing_pipeline(
         script_path=script_json_path,
         video_path=source_mp4_out,
         output_dir=clone_out_dir,
@@ -5586,7 +6213,7 @@ def run_phase13_1_new_video_e2e(
         merge_split_utterances=False,
         word_timestamps_path=words_path if words_path.exists() else clip_words_json_path,
         use_word_level_sync=True,
-        sync_anchor=sync_anchor,
+        sync_anchor=sync_anchor if sync_anchor != "adaptive" else "content_start",
         long_pause_threshold=0.55,
         mix_mode=mix_mode,
         ducking_style=ducking_style,
@@ -5602,7 +6229,7 @@ def run_phase13_1_new_video_e2e(
 
     # Run Preset Pipeline (produces final_ja_preset.mp4 for side-by-side comparison)
     preset_out_dir = out_dir / "preset_run"
-    preset_report_path, preset_report = run_phase13_1_dubbing_pipeline(
+    preset_report_path, preset_report = run_phase13_2_dubbing_pipeline(
         script_path=script_json_path,
         video_path=source_mp4_out,
         output_dir=preset_out_dir,
@@ -5610,13 +6237,13 @@ def run_phase13_1_new_video_e2e(
         speaker_source_types={"SPEAKER_01": "permitted", "SPEAKER_00": "permitted"},
         rights_mode="permitted_local",
         voice_mode="preset",
-        preset_speaker_map={"SPEAKER_01": "Uncle_Fu", "SPEAKER_00": "Ryan"},
+        preset_speaker_map={"SPEAKER_01": "Uncle_Fu", "SPEAKER_00": "Ono_Anna"},
         default_preset_voice="Uncle_Fu",
         allow_preset_fallback=True,
         merge_split_utterances=False,
         word_timestamps_path=words_path if words_path.exists() else clip_words_json_path,
         use_word_level_sync=True,
-        sync_anchor=sync_anchor,
+        sync_anchor=sync_anchor if sync_anchor != "adaptive" else "content_start",
         long_pause_threshold=0.55,
         mix_mode=mix_mode,
         ducking_style=ducking_style,
@@ -5630,18 +6257,45 @@ def run_phase13_1_new_video_e2e(
         reuse_wav_dir=None if live_qwen3_available else preset_wav_dir,
     )
 
-    # Copy top-level requested deliverables to out_dir
+    # Copy top-level requested deliverables to out_dir (including Phase 13.2 before.mp4 / after.mp4 / reports / sample WAVs)
     final_ja_clone_mp4 = out_dir / "final_ja_clone.mp4"
     final_ja_preset_mp4 = out_dir / "final_ja_preset.mp4"
     final_ja_mp4 = out_dir / "final_ja.mp4"
+    after_mp4 = out_dir / "after.mp4"
+    before_mp4 = out_dir / "before.mp4"
     shutil.copy2(clone_out_dir / "final_ja.mp4", final_ja_clone_mp4)
     shutil.copy2(clone_out_dir / "final_ja.mp4", final_ja_mp4)
+    shutil.copy2(clone_out_dir / "final_ja.mp4", after_mp4)
     shutil.copy2(preset_out_dir / "final_ja.mp4", final_ja_preset_mp4)
     shutil.copy2(clone_out_dir / "final_ja.ass", out_dir / "dubbed_ja.ass")
     shutil.copy2(clone_out_dir / "final_ja.srt", out_dir / "dubbed_ja.srt")
     shutil.copy2(clone_out_dir / "final_ja.ass", out_dir / "final_ja.ass")
     shutil.copy2(clone_out_dir / "final_ja.srt", out_dir / "final_ja.srt")
     shutil.copy2(clone_out_dir / "dubbed_audio.wav", out_dir / "dubbed_audio.wav")
+
+    # Copy Phase 13.1 before.mp4 if available, or fallback to preset_run / source_mp4
+    before_candidates = [
+        Path("/tmp/phase13_1_new_video_e2e/final_ja_clone.mp4"),
+        Path("output/phase13_1_new_video_e2e/final_ja_clone.mp4"),
+        preset_out_dir / "final_ja.mp4",
+    ]
+    for b_cand in before_candidates:
+        if b_cand.is_file() and b_cand.resolve() != before_mp4.resolve():
+            shutil.copy2(b_cand, before_mp4)
+            break
+
+    # Copy Phase 13.2 JSON reports and speaker sample WAVs to top-level out_dir
+    for fname in (
+        "voice_consistency_report.json",
+        "speaker_assignment_report.json",
+        "timing_quality_report.json",
+        "speaker_voice_registry.json",
+        "speaker_00_voice_samples.wav",
+        "speaker_01_voice_samples.wav",
+    ):
+        src_f = clone_out_dir / fname
+        if src_f.is_file():
+            shutil.copy2(src_f, out_dir / fname)
 
     # Copy comparison WAVs for the same Japanese text (Utterance 7: ID 61)
     cloned_ja_wav = out_dir / "cloned_ja.wav"
@@ -5737,7 +6391,7 @@ def run_phase13_1_new_video_e2e(
         stages_dir / "09_tempo_and_slot_fitting.json",
         {
             "stage": "09_tempo_and_slot_fitting",
-            "tempo_adjustment_summary": clone_report.get("tempo_adjustment_summary"),
+            "tempo_adjustment_summary": clone_report.get("timing_quality_report"),
             "translation_rebalance": clone_report.get("translation_rebalance"),
         },
     )
@@ -5768,7 +6422,7 @@ def run_phase13_1_new_video_e2e(
     )
 
     # Enrich top-level pipeline_report.json
-    clone_report["phase"] = "13.1"
+    clone_report["phase"] = "13.2"
     clone_report["new_video_e2e_verification"] = {
         "video_id": raw_utts_doc.get("video_id", "XuoqKYxDHVc"),
         "requested_clip_range_seconds": [float(clip_start), float(clip_end)],
@@ -5792,11 +6446,19 @@ def run_phase13_1_new_video_e2e(
         ],
         "deliverables": {
             "source_mp4": str(source_mp4_out),
+            "before_mp4": str(before_mp4) if before_mp4.is_file() else None,
+            "after_mp4": str(after_mp4),
             "final_ja_clone_mp4": str(final_ja_clone_mp4),
             "final_ja_preset_mp4": str(final_ja_preset_mp4),
             "reference_wav": str(reference_wav_out),
             "cloned_ja_wav": str(cloned_ja_wav),
             "preset_ja_wav": str(preset_ja_wav),
+            "speaker_00_voice_samples_wav": str(out_dir / "speaker_00_voice_samples.wav"),
+            "speaker_01_voice_samples_wav": str(out_dir / "speaker_01_voice_samples.wav"),
+            "voice_consistency_report_json": str(out_dir / "voice_consistency_report.json"),
+            "speaker_assignment_report_json": str(out_dir / "speaker_assignment_report.json"),
+            "timing_quality_report_json": str(out_dir / "timing_quality_report.json"),
+            "speaker_voice_registry_json": str(out_dir / "speaker_voice_registry.json"),
             "pipeline_report_json": str(out_dir / "pipeline_report.json"),
         },
         "voice_clone_vs_preset_comparison": voice_comparison,
@@ -5808,32 +6470,74 @@ def run_phase13_1_new_video_e2e(
     return top_report_path, clone_report
 
 
+def run_phase13_2_e2e(
+    *,
+    input_dir="input/XuoqKYxDHVc",
+    source_video_path=None,
+    output_dir="output/phase13_2_verification",
+    clip_start=1836.45,
+    clip_end=1871.0,
+    auto_extend_clip=True,
+    max_clip_extension_seconds=12.0,
+    duck_gain=0.18,
+    ducking_style="continuous",
+    mix_mode="continuous-voiceover",
+    sync_anchor="content_start",
+    reference_fallback_dir="/tmp/phase12_result",
+):
+    """Execute Phase 13.2 end-to-end verification and generate before/after MP4s, speaker voice samples, and JSON reports."""
+    return run_phase13_1_new_video_e2e(
+        input_dir=input_dir,
+        source_video_path=source_video_path,
+        output_dir=output_dir,
+        clip_start=clip_start,
+        clip_end=clip_end,
+        auto_extend_clip=auto_extend_clip,
+        max_clip_extension_seconds=max_clip_extension_seconds,
+        duck_gain=duck_gain,
+        ducking_style=ducking_style,
+        mix_mode=mix_mode,
+        sync_anchor=sync_anchor,
+        reference_fallback_dir=reference_fallback_dir,
+    )
+
+
 def main(argv=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if raw_argv and raw_argv[0].startswith("-"):
         raw_argv = ["run-phase12"] + raw_argv
 
     parser = argparse.ArgumentParser(
-        description="TransClip Phase 11–13.1 — Universal X-vector Japanese Dubbing MP4 Pipeline"
+        description="TransClip Phase 11–13.2 — Universal X-vector Japanese Dubbing MP4 Pipeline"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_p13_1_e2e = sub.add_parser(
-        "run-phase13-1-e2e",
-        help="Run all 13 stages of Phase 13.1 on a brand-new clip interval (boundary auto-extension, word-level sync, 18%% continuous ducking, clone vs preset comparison)",
+    for e2e_cmd, default_out in [
+        ("run-phase13-2-e2e", "output/phase13_2_verification"),
+        ("run-phase13-1-e2e", "output/phase13_1_new_video_e2e"),
+    ]:
+        p_e2e = sub.add_parser(
+            e2e_cmd,
+            help="Run all 13 stages on a clip interval with Phase 13.2 speaker consistency, natural rate, and BudouX 2-line subtitles",
+        )
+        p_e2e.add_argument("--input-dir", default="input/XuoqKYxDHVc", help="Input dataset directory containing utterances.json and word_timestamps.json")
+        p_e2e.add_argument("--source-video", default=None, help="Optional path to full source.mp4 to cut clip from")
+        p_e2e.add_argument("--clip-start", type=float, default=1836.45, help="Initial clip start in seconds (default: 1836.0)")
+        p_e2e.add_argument("--clip-end", type=float, default=1871.0, help="Initial clip end in seconds (default: 1871.0, auto-extended to 1874.65s)")
+        p_e2e.add_argument("--auto-extend-clip", dest="auto_extend_clip", action="store_true", default=True)
+        p_e2e.add_argument("--no-auto-extend-clip", dest="auto_extend_clip", action="store_false")
+        p_e2e.add_argument("--max-clip-extension", type=float, default=12.0)
+        p_e2e.add_argument("--duck-gain", type=float, default=0.18, help="Continuous ducking ratio (default: 0.18 = 18%%)")
+        p_e2e.add_argument("--ducking-style", choices=("continuous", "long-release", "dynamic"), default="continuous")
+        p_e2e.add_argument("--mix-mode", default="continuous-voiceover")
+        p_e2e.add_argument("--sync-anchor", choices=("adaptive", "content_start", "end", "start"), default="content_start" if e2e_cmd == "run-phase13-2-e2e" else "adaptive")
+        p_e2e.add_argument("--output", "--output-dir", dest="output", default=default_out)
+
+    p_p13_2 = sub.add_parser(
+        "run-phase13-2",
+        help="Run Phase 13.2 universal Japanese dubbing pipeline with locked SpeakerVoiceRegistry, natural speaking rate (no slowdown), and BudouX 2-line subtitles",
     )
-    p_p13_1_e2e.add_argument("--input-dir", default="input/XuoqKYxDHVc", help="Input dataset directory containing utterances.json and word_timestamps.json")
-    p_p13_1_e2e.add_argument("--source-video", default=None, help="Optional path to full source.mp4 to cut clip from")
-    p_p13_1_e2e.add_argument("--clip-start", type=float, default=1836.0, help="Initial clip start in seconds (default: 1836.0)")
-    p_p13_1_e2e.add_argument("--clip-end", type=float, default=1871.0, help="Initial clip end in seconds (default: 1871.0, auto-extended to 1874.65s)")
-    p_p13_1_e2e.add_argument("--auto-extend-clip", dest="auto_extend_clip", action="store_true", default=True)
-    p_p13_1_e2e.add_argument("--no-auto-extend-clip", dest="auto_extend_clip", action="store_false")
-    p_p13_1_e2e.add_argument("--max-clip-extension", type=float, default=12.0)
-    p_p13_1_e2e.add_argument("--duck-gain", type=float, default=0.18, help="Continuous ducking ratio (default: 0.18 = 18%%)")
-    p_p13_1_e2e.add_argument("--ducking-style", choices=("continuous", "long-release", "dynamic"), default="continuous")
-    p_p13_1_e2e.add_argument("--mix-mode", default="continuous-voiceover")
-    p_p13_1_e2e.add_argument("--sync-anchor", choices=("adaptive", "content_start", "end", "start"), default="adaptive")
-    p_p13_1_e2e.add_argument("--output", "--output-dir", dest="output", default="output/phase13_1_new_video_e2e")
+    _add_common_cli_arguments(p_p13_2, is_phase12=False, is_phase13=True, is_phase13_1=True, is_phase13_2=True)
 
     p_p13_1 = sub.add_parser(
         "run-phase13-1",
@@ -5861,7 +6565,7 @@ def main(argv=None):
         _add_common_cli_arguments(p, is_phase12=False, is_phase13=False, is_phase13_1=False)
 
     args = parser.parse_args(raw_argv)
-    if args.command == "run-phase13-1-e2e":
+    if args.command in ("run-phase13-1-e2e", "run-phase13-2-e2e"):
         report_path, report = run_phase13_1_new_video_e2e(
             input_dir=args.input_dir,
             source_video_path=args.source_video,
@@ -5886,6 +6590,7 @@ def main(argv=None):
     speaker_atmosphere_map = parse_key_value_mappings(args.speaker_atmosphere, flag_name="--speaker-atmosphere")
     default_preset = args.default_preset_voice or ("Ryan" if (args.voice_mode == "preset" and not args.auto_select_preset and not speaker_age_map and not speaker_atmosphere_map) else None)
 
+    is_p13_2_cmd = args.command == "run-phase13-2"
     report_path, report = run_phase11_dubbing_pipeline(
         script_path=args.script,
         video_path=args.video,
@@ -5934,6 +6639,10 @@ def main(argv=None):
         min_atempo=args.min_atempo,
         max_atempo=args.max_atempo,
         fit_utterance_slots=args.fit_utterance_slots,
+        allow_slowdown=args.allow_slowdown,
+        smooth_intra_speaker_rates=args.smooth_intra_speaker_rates,
+        enforce_voice_registry=True,
+        emit_phase13_2_reports=is_p13_2_cmd,
         word_timestamps_path=args.word_timestamps,
         use_word_level_sync=args.use_word_level_sync,
         sync_anchor=args.sync_anchor,

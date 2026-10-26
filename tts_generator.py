@@ -396,12 +396,18 @@ class QwenPresetSynthesizer:
             p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in package.glob("*.py")})
         self._model = None
 
-    def synthesize(self, *, text, profile, output_path):
+    def synthesize(self, *, text, profile=None, output_path=None, voice=None):
         import numpy as np
         import mlx.core as mx
         import soundfile as sf
         from qwen_tts_mlx import MLXQwen3TTS
-        if profile.mode != "preset" or profile.reference_audio or not profile.voice:
+        from language.voice import VoiceProfile
+
+        if profile is None and voice is not None:
+            profile = VoiceProfile(speaker="PRESET_SPEAKER", mode="preset", voice=str(voice))
+        elif isinstance(profile, str) and voice is None:
+            profile = VoiceProfile(speaker="PRESET_SPEAKER", mode="preset", voice=profile)
+        if profile is None or getattr(profile, "mode", None) != "preset" or getattr(profile, "reference_audio", None) or not getattr(profile, "voice", None):
             raise ValueError("Only explicit preset voices are allowed in this adapter.")
         if self._model is None:
             print("Loading cached Qwen3-TTS model (offline)...", flush=True)
@@ -426,7 +432,8 @@ class QwenPresetSynthesizer:
         return {"sample_rate": rate, "sample_frames": int(wav.size),
                 "token_count": sum(r.token_count for r in results),
                 "termination": "eos_before_limit", "preset": profile.voice,
-                "processing_seconds": sum(r.processing_time_seconds for r in results)}
+                "preset_voice": profile.voice,
+                "processing_seconds": sum(getattr(r, "processing_time_seconds", 0.0) for r in results)}
 
 
 def main(argv=None):

@@ -377,7 +377,7 @@ class QwenProsodyCloneSynthesizer:
             "native_source_sha256": digest(package / "tts/models/qwen3_tts/qwen3_tts.py"),
         }
 
-    def synthesize(self, *, text, profile, output_path):
+    def synthesize(self, *, text, profile, output_path, seed_override=None):
         import mlx.core as mx
         import soundfile as sf
         from qwen_tts_mlx import MLXQwen3TTS
@@ -390,6 +390,7 @@ class QwenProsodyCloneSynthesizer:
 
         started = time.perf_counter()
         snap = _snap(profile)
+        voice_prof_id = getattr(profile, "voice_profile_id", None) or snap["profile_fingerprint"]
         cond_key = f"{snap['profile_fingerprint']}:{self.clone_method}:{self.ref_trailing_silence_seconds:.3f}"
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Japanese text required.")
@@ -417,7 +418,8 @@ class QwenProsodyCloneSynthesizer:
         if not hasattr(native, "_icl_cache"):
             raise RuntimeError("Installed mlx-audio lacks the inspected ICL cache contract.")
         native._icl_cache = condition["icl_cache"]
-        mx.random.seed(self.settings["seed"])
+        active_seed = int(self.settings["seed"] if seed_override is None else seed_override)
+        mx.random.seed(active_seed)
         options = {
             k: v
             for k, v in self.settings.items()
@@ -468,9 +470,13 @@ class QwenProsodyCloneSynthesizer:
             "clone_method": self.clone_method,
             "x_vector_only_mode": self.x_vector_only_mode,
             "ref_trailing_silence_seconds": self.ref_trailing_silence_seconds,
+            "voice_profile_id": voice_prof_id,
             "profile_fingerprint": snap["profile_fingerprint"],
             "reference_audio_sha256": snap["reference_audio_sha256"],
             "reference_text_sha256": None if self.x_vector_only_mode else snap["reference_text_sha256"],
+            "model_id": self.identity.get("model"),
+            "model_revision": self.identity.get("model_revision"),
+            "generation_settings": {**self.settings, "seed": active_seed},
             "peak_memory_bytes": mx.get_peak_memory(),
             "pronunciation_verified": False,
             "voice_similarity_verified": False,
