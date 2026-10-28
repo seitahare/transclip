@@ -414,9 +414,12 @@ class QwenPresetSynthesizer:
             self._model = MLXQwen3TTS.from_pretrained(str(self.snapshot))
         mx.random.seed(self.settings["seed"])
         options = {k: v for k, v in self.settings.items() if k not in ("seed", "wav_subtype")}
-        # The facade discards token counts. Retain native results to detect the
-        # generation limit, rather than reporting truncated speech as complete.
-        results = list(self._model.model.generate_custom_voice(text=text, speaker=profile.voice, **options))
+        _VOICE_ALIASES = {"Claire": "Ono_Anna", "Ethan": "Uncle_Fu", "Mia": "Vivian", "Sophia": "Serena"}
+        target_speaker = _VOICE_ALIASES.get(profile.voice, profile.voice)
+        try:
+            results = list(self._model.model.generate_custom_voice(text=text, speaker=target_speaker, **options))
+        except Exception:
+            results = list(self._model.model.generate_custom_voice(text=text, speaker=profile.voice, **options))
         if not results:
             raise RuntimeError("Qwen returned no audio.")
         rates = {r.sample_rate for r in results}

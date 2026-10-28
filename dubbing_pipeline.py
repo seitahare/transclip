@@ -377,7 +377,7 @@ def _is_null_or_unassigned_speaker(spk):
 
 def _infer_selection_range_from_script_and_paths(script_doc, *, script_path=None, video_path=None):
     """Resolve `(selection_start, selection_end)` from script JSON or path naming (e.g. `1885_1915`)."""
-    for key in ("selection_range", "selection", "clip_range", "time_range", "window"):
+    for key in ("selection_range", "selection", "clip", "clip_range", "time_range", "window"):
         val = script_doc.get(key)
         if isinstance(val, dict):
             s = val.get("start", val.get("start_seconds"))
@@ -1885,6 +1885,7 @@ def analyze_timeline_collisions_and_overlaps(
     auto_extend_clip=False,
     max_clip_extension_seconds=12.0,
     source_video_duration=None,
+    prevent_same_speaker_overlap=False,
 ):
     """Detect same-speaker collisions & inter-speaker overlaps, measure overflows,
     align semantic clause units (and word-level speech clusters), apply bounded
@@ -2279,6 +2280,8 @@ def analyze_timeline_collisions_and_overlaps(
                             "mora_reduction_needed": max(0, prev["mora_count"] - target_mora),
                         }
                     )
+                    if prevent_same_speaker_overlap:
+                        new_start = min(running_end + 0.04, max(orig_start, clip_end_barrier - item["actual_duration"]))
             item["placement_start"] = new_start
             item["placement_end"] = new_start + item["actual_duration"]
             running_end = item["placement_end"]
@@ -3947,6 +3950,7 @@ def run_phase11_dubbing_pipeline(
     duck_hold_seconds=3.2,
     same_speaker_hold_seconds=4.0,
     hold_gap_gain=None,
+    prevent_same_speaker_overlap=False,
 ):
     """Execute the end-to-end Japanese dubbing pipeline (supporting Phase 11, Phase 12, Phase 13, Phase 13.1, and Phase 13.2 workflows)."""
     root = Path(output_dir).resolve()
@@ -4554,6 +4558,7 @@ def run_phase11_dubbing_pipeline(
         auto_extend_clip=bool(auto_extend_clip),
         max_clip_extension_seconds=max_clip_extension_seconds,
         source_video_duration=avail_source_dur,
+        prevent_same_speaker_overlap=prevent_same_speaker_overlap,
     )
     post_tts_extension = resolve_post_tts_clip_extension(
         feedback_entries=feedback_doc.get("entries", []),
@@ -4983,6 +4988,36 @@ def run_phase13_dubbing_pipeline(
         video_path=video_path,
         output_dir=output_dir,
         **defaults,
+    )
+
+
+def run_phase14_dubbing_pipeline(
+    *,
+    video_id=None,
+    input_dir=None,
+    script_path=None,
+    video_path=None,
+    output_dir="output/phase14_new_video_01",
+    voice_mode="preset",
+    preset_speaker_map=None,
+    provisional_unknown_voice=False,
+    test_synthetic_tts=False,
+    **kwargs,
+):
+    """Execute Phase 14 Universal Multi-Video Japanese Dubbing Pipeline."""
+    from phase14_universal import run_phase14_universal_dubbing
+
+    return run_phase14_universal_dubbing(
+        video_id=video_id,
+        input_dir=input_dir,
+        script_path=script_path,
+        video_path=video_path,
+        output_dir=output_dir,
+        voice_mode=voice_mode,
+        preset_speaker_map=preset_speaker_map,
+        provisional_unknown_voice=provisional_unknown_voice,
+        test_synthetic_tts=test_synthetic_tts,
+        **kwargs,
     )
 
 
@@ -6692,7 +6727,7 @@ def run_phase13_2_e2e(
 
 def main(argv=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if raw_argv and raw_argv[0].startswith("-"):
+    if raw_argv and raw_argv[0].startswith("-") and raw_argv[0] not in ("-h", "--help"):
         raw_argv = ["run-phase12"] + raw_argv
 
     parser = argparse.ArgumentParser(
@@ -6721,6 +6756,18 @@ def main(argv=None):
         p_e2e.add_argument("--mix-mode", default="continuous-voiceover")
         p_e2e.add_argument("--sync-anchor", choices=("adaptive", "content_start", "end", "start"), default="content_start" if e2e_cmd in ("run-phase13-2-e2e", "run-phase13-3-e2e") else "adaptive")
         p_e2e.add_argument("--output", "--output-dir", dest="output", default=default_out)
+
+    p_p14 = sub.add_parser(
+        "run-phase14",
+        help="Run Phase 14 universal new-video Japanese dubbing pipeline (e.g. --video-id wJasRLuu_LA --voice-mode preset)",
+    )
+    p_p14.add_argument("--video-id", default=None, help="Target video ID under input/<video_id> and output/<video_id>")
+    p_p14.add_argument("--input-dir", default=None, help="Explicit input directory containing selection.json, utterances.json, dubbing_script.json, etc.")
+    p_p14.add_argument("--provisional-unknown-voice", dest="provisional_unknown_voice", action="store_true", default=False, help="Assign a distinct provisional preset voice to UNKNOWN speakers with explicit review markers")
+    p_p14.add_argument("--hold-unknown-silent", dest="provisional_unknown_voice", action="store_false", help="Hold UNKNOWN speakers silent and record them in speaker_verification_targets.json (default)")
+    p_p14.add_argument("--test-synthetic-tts", dest="test_synthetic_tts", action="store_true", default=False, help="Explicit test-only mode: allow synthetic TTS audio when Qwen3-TTS-MLX is unavailable in unit tests")
+    _add_common_cli_arguments(p_p14, is_phase12=False, is_phase13=True, is_phase13_1=True, is_phase13_2=True)
+    p_p14.set_defaults(voice_mode="preset", output="output/phase14_new_video_01")
 
     p_p13_3 = sub.add_parser(
         "run-phase13-3",
@@ -6760,6 +6807,31 @@ def main(argv=None):
         _add_common_cli_arguments(p, is_phase12=False, is_phase13=False, is_phase13_1=False)
 
     args = parser.parse_args(raw_argv)
+    if args.command == "run-phase14":
+        preset_map = parse_preset_speaker_mappings(args.preset_speaker)
+        report_path, report = run_phase14_dubbing_pipeline(
+            video_id=args.video_id,
+            input_dir=args.input_dir,
+            script_path=args.script,
+            video_path=args.video,
+            output_dir=args.output,
+            voice_mode=args.voice_mode,
+            preset_speaker_map=preset_map,
+            provisional_unknown_voice=bool(args.provisional_unknown_voice),
+            test_synthetic_tts=bool(args.test_synthetic_tts),
+            auto_extend_clip=bool(args.auto_extend_clip),
+            max_clip_extension_seconds=float(args.max_clip_extension),
+            target_lufs=float(args.target_lufs),
+            duck_hold_seconds=float(args.duck_hold_seconds),
+            same_speaker_hold_seconds=float(args.same_speaker_hold_seconds),
+            duck_gain=float(args.duck_gain),
+            ducking_style=args.ducking_style,
+            mix_mode=args.mix_mode,
+            reuse_wav_dir=args.reuse_wav_dir,
+        )
+        print(json.dumps({"report_path": str(report_path), "status": report["status"], "tts_execution_mode": report.get("tts_execution_mode")}, ensure_ascii=False))
+        return 0
+
     if args.command in ("run-phase13-1-e2e", "run-phase13-2-e2e", "run-phase13-3-e2e"):
         report_path, report = run_phase13_1_new_video_e2e(
             input_dir=args.input_dir,
